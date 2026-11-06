@@ -8,6 +8,7 @@ mod enemy;
 mod ragdoll;
 mod render;
 mod ui;
+pub mod chrono_shift;
 #[cfg(test)]
 mod tests;
 
@@ -18,6 +19,7 @@ use enemy::{Enemy, EnemyState, EnemyType, WaveManager, WaveAction, step_enemy_ai
 use ragdoll::{RagdollPiece, RagdollPart, SliceParticle, calculate_slice_split_velocities, update_ragdoll_physics};
 use render::{render_game_gizmos, GhostTrail, generate_stickman_pose};
 use ui::{setup_ui, update_ui_system};
+use chrono_shift::{ChronoShiftPlugin, ChronoShifter};
 
 #[derive(Resource, Default)]
 pub struct CursorWorldCoords(pub Option<Vec2>);
@@ -65,6 +67,7 @@ fn main() {
         .init_resource::<WaveManager>()
         .init_resource::<CursorWorldCoords>()
         .add_event::<SliceEnemyEvent>()
+        .add_plugins(ChronoShiftPlugin)
         .add_systems(Startup, (setup_level, setup_ui, setup_audio_assets))
         .add_systems(
             Update,
@@ -123,11 +126,18 @@ fn setup_level(mut commands: Commands) {
     ));
 }
 
-fn update_cursor_system(
+pub fn update_cursor_system(
     mut cursor_coords: ResMut<CursorWorldCoords>,
     q_window: Query<&Window>,
     q_camera: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    shifter: Option<Res<ChronoShifter>>,
 ) {
+    if let Some(ref s) = shifter {
+        if s.aim_frozen() {
+            return;
+        }
+    }
+
     let Ok(window) = q_window.get_single() else {
         cursor_coords.0 = None;
         return;
@@ -156,47 +166,25 @@ fn update_camera_shake_system(
     }
 }
 
-fn player_input_and_movement_system(
+pub fn player_input_and_movement_system(
     time: Res<Time<Real>>,
-    mut chrono: ResMut<ChronoState>,
+    chrono: Res<ChronoState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     cursor: Res<CursorWorldCoords>,
-    mut player_q: Query<(&mut Transform, &mut Player, &mut ChronoEnergy)>,
+    mut player_q: Query<(&mut Transform, &mut Player)>,
     platforms_q: Query<&Platform>,
     audio: Option<Res<GameAudioAssets>>,
     mut commands: Commands,
 ) {
-    let Ok((mut transform, mut player, mut energy)) = player_q.get_single_mut() else {
+    let Ok((mut transform, mut player)) = player_q.get_single_mut() else {
         return;
     };
 
     let real_dt = time.delta_secs();
 
-    // 1. Time Dilation (Slow Motion): Holding Right Click or Shift (when not dashing)
-    let was_dilating = chrono.is_dilating;
-    let slowmo_requested = mouse_buttons.pressed(MouseButton::Right) || keyboard.pressed(KeyCode::KeyC);
-    if slowmo_requested && energy.current > 0.0 {
-        chrono.is_dilating = true;
-        if !was_dilating {
-            if let Some(ref sfx) = audio {
-                commands.spawn((AudioPlayer::new(sfx.slowmo_enter.clone()), PlaybackSettings::DESPAWN));
-            }
-        }
-    } else {
-        chrono.is_dilating = false;
-        if was_dilating {
-            if let Some(ref sfx) = audio {
-                commands.spawn((AudioPlayer::new(sfx.slowmo_exit.clone()), PlaybackSettings::DESPAWN));
-            }
-        }
-    }
-
-    // Tick Chrono Energy
-    energy.update(chrono.is_dilating, real_dt);
-    if energy.current <= 0.0 {
-        chrono.is_dilating = false;
-    }
+    // 1. Time Dilation is driven dynamically by the Chronos Shift stick-shift (Shift hold)
+    // and meter drain/regen is handled by ChronoShiftPlugin before this system runs.
 
     let dt = chrono.get_player_dt(real_dt);
     if dt <= 0.0 {
@@ -224,8 +212,8 @@ fn player_input_and_movement_system(
         }
     }
 
-    // 2. Dash Movement: KeyCode::ShiftLeft or KeyCode::Space (if not jumping)
-    let dash_key = keyboard.just_pressed(KeyCode::ShiftLeft);
+    // 2. Dash Movement: KeyCode::KeyE or MouseButton::Middle
+    let dash_key = keyboard.just_pressed(KeyCode::KeyE) || mouse_buttons.just_pressed(MouseButton::Middle);
     if dash_key && player.dash_cooldown <= 0.0 {
         if let Some(ref sfx) = audio {
             commands.spawn((AudioPlayer::new(sfx.dash.clone()), PlaybackSettings::DESPAWN));
@@ -340,7 +328,7 @@ fn player_input_and_movement_system(
     }
 }
 
-fn player_katana_slash_system(
+pub fn player_katana_slash_system(
     _time: Res<Time<Real>>,
     chrono: Res<ChronoState>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -405,11 +393,10 @@ fn player_katana_slash_system(
     }
 }
 
-fn player_chrono_warp_system(
+pub fn player_chrono_warp_system(
     time: Res<Time<Real>>,
     chrono: Res<ChronoState>,
     keyboard: Res<ButtonInput<KeyCode>>,
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
     cursor: Res<CursorWorldCoords>,
     mut player_q: Query<(&mut Transform, &mut Player, &mut ChronoEnergy), Without<Enemy>>,
     enemies_q: Query<(Entity, &Transform, &Enemy), Without<Player>>,
@@ -426,9 +413,7 @@ fn player_chrono_warp_system(
     }
 
     let warp_pressed = keyboard.just_pressed(KeyCode::KeyQ)
-        || keyboard.just_pressed(KeyCode::KeyF)
-        || keyboard.just_pressed(KeyCode::KeyE)
-        || mouse_buttons.just_pressed(MouseButton::Middle);
+        || keyboard.just_pressed(KeyCode::KeyF);
 
     if warp_pressed && player.warp_cooldown <= 0.0 && energy.can_teleport() {
         let Some(cursor_pos) = cursor.0 else {
@@ -802,6 +787,7 @@ fn game_restart_system(
     mut wave_mgr: ResMut<WaveManager>,
     mut combo: ResMut<ComboState>,
     mut chrono: ResMut<ChronoState>,
+    shifter: Option<ResMut<ChronoShifter>>,
     mut commands: Commands,
 ) {
     if keyboard.just_pressed(KeyCode::KeyR) {
@@ -827,5 +813,8 @@ fn game_restart_system(
         *wave_mgr = WaveManager::default();
         combo.reset();
         *chrono = ChronoState::default();
+        if let Some(mut s) = shifter {
+            *s = ChronoShifter::default();
+        }
     }
 }

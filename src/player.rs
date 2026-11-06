@@ -152,6 +152,16 @@ impl ChronoEnergy {
         }
     }
 
+    pub fn update_with_drain(&mut self, drain: f32, dt: f32) {
+        let drain = if drain.is_finite() { drain.max(0.0) } else { 0.0 };
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        if drain > 0.0 {
+            self.current = (self.current - drain * dt).max(0.0);
+        } else {
+            self.current = (self.current + self.regen_rate * dt).min(self.max);
+        }
+    }
+
     pub fn reward_kill(&mut self) {
         self.current = (self.current + self.kill_restore).min(self.max);
     }
