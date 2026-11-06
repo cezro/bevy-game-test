@@ -253,6 +253,10 @@ impl WaveManager {
                 remaining_to_spawn,
                 spawn_timer,
             } => {
+                if *remaining_to_spawn == 0 {
+                    self.phase = WavePhase::Active;
+                    return None;
+                }
                 *spawn_timer -= dt;
                 if *spawn_timer <= 0.0 && *remaining_to_spawn > 0 {
                     *remaining_to_spawn -= 1;
@@ -280,7 +284,7 @@ impl WaveManager {
                 }
             }
             WavePhase::Active => {
-                if self.alive_count == 0 {
+                if self.total_wave_enemies > 0 && self.alive_count == 0 {
                     self.phase = WavePhase::WaveCleared { timer: 2.0 };
                     return Some(WaveAction::AnnounceClear(self.current_wave));
                 }

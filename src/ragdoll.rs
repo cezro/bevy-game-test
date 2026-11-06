@@ -77,7 +77,7 @@ pub fn calculate_slice_split_velocities(
 pub fn update_ragdoll_physics(
     time: Res<Time<Real>>,
     chrono: Res<crate::time_control::ChronoState>,
-    mut ragdolls: Query<(&mut Transform, &mut RagdollPiece)>,
+    mut ragdolls: Query<(Entity, &mut Transform, &mut RagdollPiece)>,
     mut particles: Query<(&mut Transform, &mut SliceParticle, Entity), Without<RagdollPiece>>,
     platforms: Query<&crate::player::Platform>,
     mut commands: Commands,
@@ -90,10 +90,10 @@ pub fn update_ragdoll_physics(
     let floor_y = -260.0;
     let gravity = 1200.0;
 
-    for (mut transform, mut piece) in ragdolls.iter_mut() {
+    for (entity, mut transform, mut piece) in ragdolls.iter_mut() {
         piece.lifetime -= dt;
         if piece.lifetime <= 0.0 {
-            // Despawned later or by separate system
+            commands.entity(entity).despawn();
             continue;
         }
 

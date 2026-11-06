@@ -465,7 +465,7 @@ fn player_chrono_warp_system(
     }
 }
 
-fn slice_event_resolution_system(
+pub fn slice_event_resolution_system(
     mut slice_events: EventReader<SliceEnemyEvent>,
     mut chrono: ResMut<ChronoState>,
     mut combo: ResMut<ComboState>,
@@ -474,7 +474,13 @@ fn slice_event_resolution_system(
     enemies_q: Query<(&Enemy, &Transform)>,
     mut commands: Commands,
 ) {
+    let mut processed = std::collections::HashSet::new();
+
     for ev in slice_events.read() {
+        if !processed.insert(ev.enemy_entity) {
+            continue;
+        }
+
         let Ok((enemy, _transform)) = enemies_q.get(ev.enemy_entity) else {
             continue;
         };
@@ -618,8 +624,13 @@ fn enemy_ai_system(
         e_transform.translation.x += enemy.velocity.x * dt;
         e_transform.translation.y += enemy.velocity.y * dt;
 
-        // Clamp to screen bounds
+        // Clamp to screen bounds and arena floor
         e_transform.translation.x = e_transform.translation.x.clamp(-580.0, 580.0);
+        if e_transform.translation.y < -350.0 {
+            e_transform.translation.y = floor_y;
+            enemy.velocity.y = 0.0;
+            enemy.is_grounded = true;
+        }
 
         // 4. Platform and Floor Collision
         enemy.is_grounded = false;
@@ -734,6 +745,7 @@ fn game_restart_system(
     particles_q: Query<Entity, With<SliceParticle>>,
     mut wave_mgr: ResMut<WaveManager>,
     mut combo: ResMut<ComboState>,
+    mut chrono: ResMut<ChronoState>,
     mut commands: Commands,
 ) {
     if keyboard.just_pressed(KeyCode::KeyR) {
@@ -758,5 +770,6 @@ fn game_restart_system(
         // Reset managers
         *wave_mgr = WaveManager::default();
         combo.reset();
+        *chrono = ChronoState::default();
     }
 }

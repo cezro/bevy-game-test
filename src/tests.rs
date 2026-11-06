@@ -464,6 +464,9 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         app.init_resource::<ChronoState>();
+        app.add_systems(PreUpdate, |mut time: ResMut<Time<Real>>| {
+            time.advance_by(std::time::Duration::from_millis(100));
+        });
         app.add_systems(Update, update_ragdoll_physics);
 
         let entity = app.world_mut().spawn((
