@@ -577,4 +577,39 @@ mod tests {
             _ => {}
         }
     }
+
+        #[test]
+    fn test_adversarial_enemy_out_of_bounds_recovery() {
+        use crate::*;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<ChronoState>();
+        app.add_systems(PreUpdate, |mut time: ResMut<Time<Real>>| {
+            time.advance_by(std::time::Duration::from_millis(50));
+        });
+        app.add_systems(Update, enemy_ai_system);
+
+        // Spawn a dummy player at center
+        app.world_mut().spawn((
+            Player::default(),
+            Transform::from_xyz(0.0, -260.0, 0.0),
+        ));
+
+        // Spawn an enemy way below the arena floor (out of bounds at y = -500)
+        let enemy_entity = app.world_mut().spawn((
+            Enemy::new(EnemyType::Runner),
+            Transform::from_xyz(100.0, -500.0, 0.0),
+        )).id();
+
+        // Run update
+        app.update();
+
+        // Enemy transform must be recovered to floor_y (-260.0)
+        let transform = app.world().get::<Transform>(enemy_entity).unwrap();
+        assert_eq!(
+            transform.translation.y, -260.0,
+            "Enemy falling out-of-bounds must be safely recovered to floor_y!"
+        );
+    }
 }
