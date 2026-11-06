@@ -333,6 +333,7 @@ pub fn player_katana_slash_system(
     chrono: Res<ChronoState>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     cursor: Res<CursorWorldCoords>,
+    shifter: Option<Res<ChronoShifter>>,
     mut player_q: Query<(&Transform, &mut Player), Without<Enemy>>,
     enemies_q: Query<(Entity, &Transform, &Enemy), Without<Player>>,
     audio: Option<Res<GameAudioAssets>>,
@@ -340,6 +341,12 @@ pub fn player_katana_slash_system(
     mut accuracy_events: EventWriter<CombatAccuracyEvent>,
     mut commands: Commands,
 ) {
+    if let Some(ref s) = shifter {
+        if s.is_held() {
+            return;
+        }
+    }
+
     let Ok((p_transform, mut player)) = player_q.get_single_mut() else {
         return;
     };

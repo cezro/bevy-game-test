@@ -48,7 +48,7 @@ pub const SEAT_THRESHOLD: f32 = 0.45;
 /// Detent spring stiffness (1/s).
 pub const DETENT_K: f32 = 16.0;
 /// Animated path speed for wheel / number-key / release shifts (gate units per second).
-pub const PATH_SPEED: f32 = 10.0;
+pub const PATH_SPEED: f32 = 24.0;
 /// Raw mouse pixels per gate unit while dragging the stick.
 pub const DRAG_PX_PER_UNIT: f32 = 90.0;
 /// Per-frame drag magnitude (gate units) below which mouse jitter is ignored.
@@ -336,9 +336,9 @@ pub fn nearest_column(x: f32) -> f32 {
     }
 }
 
-/// `Some(col)` when `x` is exactly on a column.
+/// `Some(col)` when `x` is on a column (within epsilon).
 pub fn exact_column(x: f32) -> Option<f32> {
-    COLUMNS.iter().copied().find(|&c| x == c)
+    COLUMNS.iter().copied().find(|&c| (x - c).abs() < 1e-3)
 }
 
 /// The H-gate legality predicate.
@@ -368,11 +368,18 @@ fn micro_step(p: Vec2, d: Vec2) -> Vec2 {
         let mut ny = p.y + d.y;
         if ny.abs() > RAIL_TOL {
             let col = nearest_column(nx);
-            if (nx - col).abs() <= COL_TOL {
+            // Center column (Gear 3/4) is only entered if not actively sliding horizontally across the rail.
+            // End columns (-1 for G1/G2, +1 for G5/G6) capture the stick as soon as it reaches the end.
+            let can_enter = if col == 0.0 {
+                d.x.abs() <= 0.005 && (nx - col).abs() <= COL_TOL
+            } else {
+                (nx - col).abs() <= COL_TOL
+            };
+            if can_enter {
                 nx = col; // snap into the slot
                 ny = ny.clamp(-1.0, 1.0);
             } else {
-                ny = ny.clamp(-RAIL_TOL, RAIL_TOL); // gate wall
+                ny = ny.clamp(-RAIL_TOL, RAIL_TOL); // slide along gate crossbar wall
             }
         }
         Vec2::new(nx, ny)
@@ -696,12 +703,13 @@ impl ShifterModel {
         }
 
         // 5. Timers.
+        let is_in_gear = self.target.map_or(false, |g| g != Gear::N) || display_gear(self.knob) != Gear::N;
         let fade_target = if self.held {
             1.0
-        } else if self.stalled || self.knob == Vec2::ZERO {
+        } else if self.stalled || !is_in_gear {
             0.0
         } else {
-            0.65 // persistent in-gear display while cruising in slowmo
+            0.85 // persistent in-gear display while cruising in slowmo
         };
         let fade_step = dt / FADE_TIME;
         self.fade = if self.fade < fade_target {
@@ -713,7 +721,13 @@ impl ShifterModel {
         self.seat_kick = (self.seat_kick - dt).max(0.0);
 
         // 6. Output.
-        self.dilation = if self.stalled { 1.0 } else { dilation_at(self.knob) };
+        self.dilation = if self.stalled {
+            1.0
+        } else if !self.held && self.target.map_or(false, |g| g != Gear::N) && self.knob.y.abs() <= RAIL_TOL {
+            self.target.unwrap().dilation()
+        } else {
+            dilation_at(self.knob)
+        };
         out.dilation = self.dilation;
         out
     }
@@ -794,25 +808,62 @@ fn number_key_target(keyboard: &ButtonInput<KeyCode>) -> Option<Gear> {
         (KeyCode::Digit5, KeyCode::Numpad5, Gear::G5),
         (KeyCode::Digit6, KeyCode::Numpad6, Gear::G6),
     ];
-    if keyboard.just_pressed(KeyCode::Backquote) {
+    if keyboard.just_pressed(KeyCode::Backquote) || keyboard.just_pressed(KeyCode::Space) {
         return Some(Gear::N);
     }
-    MAP.iter()
+    if let Some((_, _, g)) = MAP
+        .iter()
         .rev()
         .find(|(a, b, _)| keyboard.just_pressed(*a) || keyboard.just_pressed(*b))
-        .map(|(_, _, g)| *g)
+    {
+        return Some(*g);
+    }
+
+    // Directional WASD / Arrow keys while Shift is held:
+    let left = keyboard.just_pressed(KeyCode::KeyA) || keyboard.just_pressed(KeyCode::ArrowLeft);
+    let right = keyboard.just_pressed(KeyCode::KeyD) || keyboard.just_pressed(KeyCode::ArrowRight);
+    let up = keyboard.just_pressed(KeyCode::KeyW) || keyboard.just_pressed(KeyCode::ArrowUp);
+    let down = keyboard.just_pressed(KeyCode::KeyS) || keyboard.just_pressed(KeyCode::ArrowDown);
+
+    let l_held = keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft);
+    let r_held = keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight);
+    let u_held = keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp);
+    let d_held = keyboard.pressed(KeyCode::KeyS) || keyboard.pressed(KeyCode::ArrowDown);
+
+    if (left && u_held) || (up && l_held) {
+        Some(Gear::G1)
+    } else if (left && d_held) || (down && l_held) {
+        Some(Gear::G2)
+    } else if (right && u_held) || (up && r_held) {
+        Some(Gear::G5)
+    } else if (right && d_held) || (down && r_held) {
+        Some(Gear::G6)
+    } else if up && !l_held && !r_held {
+        Some(Gear::G3)
+    } else if down && !l_held && !r_held {
+        Some(Gear::G4)
+    } else if left && !u_held && !d_held {
+        Some(Gear::G1)
+    } else if right && !u_held && !d_held {
+        Some(Gear::G5)
+    } else {
+        None
+    }
 }
 
 /// Reads input, steps the model, writes `ChronoState` and drains/regens the meter.
 pub fn chrono_shift_control_system(
     time: Res<Time<Real>>,
     keyboard: Res<ButtonInput<KeyCode>>,
+    mouse_buttons: Option<Res<ButtonInput<MouseButton>>>,
     mut motion: EventReader<MouseMotion>,
     mut wheel: EventReader<MouseWheel>,
     mut accuracy_events: EventReader<CombatAccuracyEvent>,
     mut shifter: ResMut<ChronoShifter>,
     mut chrono: ResMut<ChronoState>,
     mut energy_q: Query<&mut ChronoEnergy, With<Player>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
 ) {
     let dt = time.delta_secs();
     let held = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
@@ -830,13 +881,35 @@ pub fn chrono_shift_control_system(
         }
     }
 
+    let mut click_gear = None;
+    if held {
+        if let Some(mb) = mouse_buttons.as_deref() {
+            if mb.just_pressed(MouseButton::Left) {
+                if let (Ok(win), Ok((cam, cam_tf))) = (windows.get_single(), cameras.get_single()) {
+                    if let Some(cursor_screen) = win.cursor_position() {
+                        if let Ok(cursor_world) = cam.viewport_to_world_2d(cam_tf, cursor_screen) {
+                            let origin = cam_tf.translation().truncate() + GATE_CENTER;
+                            for g in &Gear::ALL {
+                                let g_pos = origin + g.pos() * GATE_SCALE;
+                                if (cursor_world - g_pos).length() <= 32.0 {
+                                    click_gear = Some(*g);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let input = if held {
         ShifterInput {
             held,
             // MouseMotion y grows downward; gate y grows upward.
             drag: Vec2::new(drag_px.x, -drag_px.y) / DRAG_PX_PER_UNIT,
             wheel_steps,
-            jump_to: number_key_target(&keyboard),
+            jump_to: click_gear.or_else(|| number_key_target(&keyboard)),
         }
     } else {
         ShifterInput::default()
@@ -900,37 +973,26 @@ pub fn chrono_shift_control_system(
     }
 }
 
-/// Pins the OS cursor at its press position and freezes the aim while the shifter is held.
+/// Freezes the combat aim while the shifter is held.
 pub fn chrono_shift_cursor_pin_system(
     mut shifter: ResMut<ChronoShifter>,
     mut cursor: ResMut<CursorWorldCoords>,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
 ) {
     let held = shifter.model.held;
-    let mut window = windows.get_single_mut().ok();
+    let window = windows.get_single().ok();
 
     if held && !shifter.aim_locked {
         shifter.aim_locked = true;
         shifter.frozen_aim = cursor.0;
-        shifter.anchor_screen = window.as_ref().and_then(|w| w.cursor_position());
-        if let Some(w) = window.as_deref_mut() {
-            w.cursor_options.visible = false;
-        }
+        shifter.anchor_screen = window.and_then(|w| w.cursor_position());
     } else if !held && shifter.aim_locked {
         shifter.aim_locked = false;
         shifter.anchor_screen = None;
-        if let Some(w) = window.as_deref_mut() {
-            w.cursor_options.visible = true;
-        }
     }
 
     if shifter.aim_locked {
         cursor.0 = shifter.frozen_aim;
-        if let (Some(anchor), Some(w)) = (shifter.anchor_screen, window.as_deref_mut()) {
-            if w.cursor_position() != Some(anchor) {
-                w.set_cursor_position(Some(anchor));
-            }
-        }
     }
 }
 
@@ -1562,7 +1624,7 @@ mod tests {
             assert_eq!(m.knob, Gear::G6.pos(), "Gear must stay engaged on Shift release");
             assert!((out.dilation - 0.04).abs() < 1e-6, "Time dilation remains active while cruising");
         }
-        assert!((m.fade - 0.65).abs() < 0.01, "HUD stays persistently visible in gear");
+        assert!((m.fade - 0.85).abs() < 0.01, "HUD stays persistently visible in gear");
 
         // To return to Neutral: player holds Shift and selects Neutral (0 / `)
         m.step(&ShifterInput { held: true, jump_to: Some(Gear::N), ..default() }, 1.0, 0.016);
@@ -2370,6 +2432,72 @@ mod tests {
             let chrono = app.world().resource::<ChronoState>();
             assert_eq!(chrono.slowmo_factor, 1.0);
             assert!(!chrono.is_dilating);
+        }
+    }
+
+    #[test]
+    fn test_hold_shift_move_to_1st_release_shift_maintains_1st() {
+        let mut app = test_app();
+
+        // 1. Hold Shift and shift to 1st (Digit1)
+        key(&mut app, KeyCode::ShiftLeft, true);
+        key(&mut app, KeyCode::Digit1, true);
+        app.update();
+        key(&mut app, KeyCode::Digit1, false);
+        run(&mut app, 30);
+
+        // Knob reached 1st gear
+        {
+            let s = app.world().resource::<ChronoShifter>();
+            assert_eq!(s.model.knob, Gear::G1.pos());
+            let chrono = app.world().resource::<ChronoState>();
+            assert!((chrono.slowmo_factor - 0.75).abs() < 1e-4);
+            assert!(chrono.is_dilating);
+        }
+
+        // 2. Release Shift: MUST MAINTAIN 1ST!
+        key(&mut app, KeyCode::ShiftLeft, false);
+        run(&mut app, 60);
+
+        {
+            let s = app.world().resource::<ChronoShifter>();
+            assert_eq!(s.model.knob, Gear::G1.pos(), "Stick must stay in 1st gear on Shift release");
+            assert!(!s.is_held(), "Shift is no longer held");
+            assert!((s.model.fade - 0.85).abs() < 0.02, "HUD remains visible in cruising mode");
+
+            let chrono = app.world().resource::<ChronoState>();
+            assert_eq!(chrono.slowmo_factor, 0.75, "Time dilation remains active in 1st gear");
+            assert!(chrono.is_dilating);
+        }
+    }
+
+    #[test]
+    fn test_drag_diagonal_to_1st_maintains_1st() {
+        let mut app = test_app();
+        key(&mut app, KeyCode::ShiftLeft, true);
+        app.update();
+
+        // Drag mouse diagonally up-left over 15 frames:
+        for _ in 0..15 {
+            app.world_mut().send_event(MouseMotion { delta: Vec2::new(-20.0, -20.0) });
+            app.update();
+        }
+
+        // Must arrive at Gear 1!
+        {
+            let s = app.world().resource::<ChronoShifter>();
+            assert_eq!(s.model.knob, Gear::G1.pos(), "Knob must arrive at Gear 1");
+        }
+
+        // Release Shift: must maintain Gear 1!
+        key(&mut app, KeyCode::ShiftLeft, false);
+        run(&mut app, 30);
+        {
+            let s = app.world().resource::<ChronoShifter>();
+            assert_eq!(s.model.knob, Gear::G1.pos(), "Must maintain Gear 1 on release");
+            let chrono = app.world().resource::<ChronoState>();
+            assert!((chrono.slowmo_factor - 0.75).abs() < 1e-4);
+            assert!(chrono.is_dilating);
         }
     }
 }
