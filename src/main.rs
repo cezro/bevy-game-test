@@ -301,8 +301,8 @@ fn player_katana_slash_system(
     chrono: Res<ChronoState>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     cursor: Res<CursorWorldCoords>,
-    mut player_q: Query<(&Transform, &mut Player)>,
-    enemies_q: Query<(Entity, &Transform, &Enemy)>,
+    mut player_q: Query<(&Transform, &mut Player), Without<Enemy>>,
+    enemies_q: Query<(Entity, &Transform, &Enemy), Without<Player>>,
     mut slice_events: EventWriter<SliceEnemyEvent>,
     mut commands: Commands,
 ) {
@@ -363,8 +363,8 @@ fn player_chrono_warp_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     cursor: Res<CursorWorldCoords>,
-    mut player_q: Query<(&mut Transform, &mut Player, &mut ChronoEnergy)>,
-    enemies_q: Query<(Entity, &Transform, &Enemy)>,
+    mut player_q: Query<(&mut Transform, &mut Player, &mut ChronoEnergy), Without<Enemy>>,
+    enemies_q: Query<(Entity, &Transform, &Enemy), Without<Player>>,
     mut slice_events: EventWriter<SliceEnemyEvent>,
     mut commands: Commands,
 ) {
@@ -576,7 +576,7 @@ fn enemy_ai_system(
     time: Res<Time<Real>>,
     chrono: Res<ChronoState>,
     mut player_q: Query<(&Transform, &mut Player), Without<Enemy>>,
-    mut enemies_q: Query<(Entity, &mut Transform, &mut Enemy)>,
+    mut enemies_q: Query<(Entity, &mut Transform, &mut Enemy), Without<Player>>,
     platforms_q: Query<&Platform>,
 ) {
     let dt = chrono.get_world_dt(time.delta_secs());
