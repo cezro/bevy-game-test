@@ -2298,4 +2298,78 @@ mod tests {
         assert_eq!(accl.mastered_tier, 0); // Cannot skip prerequisite gears
         assert!(accl.feedback_banner.contains("MASTER G5 FIRST"));
     }
+
+    #[test]
+    fn test_app_gear_persists_across_shift_presses_and_changes() {
+        let mut app = test_app();
+        // 1. Hold Shift and shift to Gear 2
+        engage(&mut app, KeyCode::Digit2);
+        assert!((app.world().resource::<ChronoState>().slowmo_factor - 0.55).abs() < 1e-4);
+
+        // 2. Release Shift: stick stays in Gear 2!
+        key(&mut app, KeyCode::ShiftLeft, false);
+        set_energy(&mut app, 100.0);
+        run(&mut app, 30);
+        {
+            let chrono = app.world().resource::<ChronoState>();
+            assert!((chrono.slowmo_factor - 0.55).abs() < 1e-4, "Dilation persists in Gear 2");
+            assert!(chrono.is_dilating);
+            let s = app.world().resource::<ChronoShifter>();
+            assert!(!s.is_held());
+            assert_eq!(s.model.knob, Gear::G2.pos());
+        }
+
+        // 3. Press Shift again, but DO NOT change gear
+        key(&mut app, KeyCode::ShiftLeft, true);
+        run(&mut app, 20);
+        {
+            let s = app.world().resource::<ChronoShifter>();
+            assert!(s.is_held());
+            assert_eq!(s.model.knob, Gear::G2.pos(), "Knob did not move when Shift pressed");
+        }
+
+        // 4. Release Shift again without changing: still in Gear 2!
+        key(&mut app, KeyCode::ShiftLeft, false);
+        run(&mut app, 20);
+        {
+            let chrono = app.world().resource::<ChronoState>();
+            assert!((chrono.slowmo_factor - 0.55).abs() < 1e-4);
+            let s = app.world().resource::<ChronoShifter>();
+            assert_eq!(s.model.knob, Gear::G2.pos());
+        }
+
+        // 5. Press Shift and change to Gear 4
+        key(&mut app, KeyCode::ShiftLeft, true);
+        key(&mut app, KeyCode::Digit4, true);
+        app.update();
+        key(&mut app, KeyCode::Digit4, false);
+        run(&mut app, 30);
+        {
+            let s = app.world().resource::<ChronoShifter>();
+            assert_eq!(s.model.knob, Gear::G4.pos());
+        }
+
+        // 6. Release Shift: stays in Gear 4!
+        key(&mut app, KeyCode::ShiftLeft, false);
+        set_energy(&mut app, 100.0);
+        run(&mut app, 30);
+        {
+            let chrono = app.world().resource::<ChronoState>();
+            assert!((chrono.slowmo_factor - 0.24).abs() < 1e-4);
+            let s = app.world().resource::<ChronoShifter>();
+            assert_eq!(s.model.knob, Gear::G4.pos());
+        }
+
+        // 7. Run out of energy -> automatically stalls to Neutral
+        set_energy(&mut app, 0.0);
+        run(&mut app, 10);
+        {
+            let s = app.world().resource::<ChronoShifter>();
+            assert!(s.model.stalled);
+            assert_eq!(s.model.knob, Vec2::ZERO);
+            let chrono = app.world().resource::<ChronoState>();
+            assert_eq!(chrono.slowmo_factor, 1.0);
+            assert!(!chrono.is_dilating);
+        }
+    }
 }

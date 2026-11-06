@@ -190,7 +190,7 @@ pub fn setup_ui(mut commands: Commands) {
             .with_children(|bot| {
                 bot.spawn((
                     Text::new(
-                        "[A/D] Move   [W/Space] Jump   [E/MClick] Dash   [LClick] Slash   [Q/F] Warp   [Shift (Hold)] Stick Shift Time Dilator   [1-6 / Wheel / Drag] Gears",
+                        "[A/D] Move   [W/Space] Jump   [E/MClick] Dash   [LClick] Slash   [Q/F] Warp   [Shift + 1-6/Drag/Wheel] Shift (Persists on Release)   [Shift + 0] Neutral",
                     ),
                     TextFont {
                         font_size: 13.0,
