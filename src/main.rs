@@ -25,6 +25,30 @@ pub struct CursorWorldCoords(pub Option<Vec2>);
 #[derive(Component)]
 pub struct MainCamera;
 
+#[derive(Resource)]
+pub struct GameAudioAssets {
+    pub slash: Handle<AudioSource>,
+    pub warp: Handle<AudioSource>,
+    pub slowmo_enter: Handle<AudioSource>,
+    pub slowmo_exit: Handle<AudioSource>,
+    pub slice_kill: Handle<AudioSource>,
+    pub dash: Handle<AudioSource>,
+    pub jump: Handle<AudioSource>,
+}
+
+fn setup_audio_assets(mut commands: Commands, asset_server: Res<AssetServer>) {
+    commands.insert_resource(GameAudioAssets {
+        slash: asset_server.load("audio/slash.wav"),
+        warp: asset_server.load("audio/warp.wav"),
+        slowmo_enter: asset_server.load("audio/slowmo_enter.wav"),
+        slowmo_exit: asset_server.load("audio/slowmo_exit.wav"),
+        slice_kill: asset_server.load("audio/slice_kill.wav"),
+        dash: asset_server.load("audio/dash.wav"),
+        jump: asset_server.load("audio/jump.wav"),
+    });
+}
+
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -41,7 +65,7 @@ fn main() {
         .init_resource::<WaveManager>()
         .init_resource::<CursorWorldCoords>()
         .add_event::<SliceEnemyEvent>()
-        .add_systems(Startup, (setup_level, setup_ui))
+        .add_systems(Startup, (setup_level, setup_ui, setup_audio_assets))
         .add_systems(
             Update,
             (
@@ -140,6 +164,7 @@ fn player_input_and_movement_system(
     cursor: Res<CursorWorldCoords>,
     mut player_q: Query<(&mut Transform, &mut Player, &mut ChronoEnergy)>,
     platforms_q: Query<&Platform>,
+    audio: Option<Res<GameAudioAssets>>,
     mut commands: Commands,
 ) {
     let Ok((mut transform, mut player, mut energy)) = player_q.get_single_mut() else {
@@ -149,11 +174,22 @@ fn player_input_and_movement_system(
     let real_dt = time.delta_secs();
 
     // 1. Time Dilation (Slow Motion): Holding Right Click or Shift (when not dashing)
+    let was_dilating = chrono.is_dilating;
     let slowmo_requested = mouse_buttons.pressed(MouseButton::Right) || keyboard.pressed(KeyCode::KeyC);
     if slowmo_requested && energy.current > 0.0 {
         chrono.is_dilating = true;
+        if !was_dilating {
+            if let Some(ref sfx) = audio {
+                commands.spawn((AudioPlayer::new(sfx.slowmo_enter.clone()), PlaybackSettings::DESPAWN));
+            }
+        }
     } else {
         chrono.is_dilating = false;
+        if was_dilating {
+            if let Some(ref sfx) = audio {
+                commands.spawn((AudioPlayer::new(sfx.slowmo_exit.clone()), PlaybackSettings::DESPAWN));
+            }
+        }
     }
 
     // Tick Chrono Energy
@@ -191,6 +227,9 @@ fn player_input_and_movement_system(
     // 2. Dash Movement: KeyCode::ShiftLeft or KeyCode::Space (if not jumping)
     let dash_key = keyboard.just_pressed(KeyCode::ShiftLeft);
     if dash_key && player.dash_cooldown <= 0.0 {
+        if let Some(ref sfx) = audio {
+            commands.spawn((AudioPlayer::new(sfx.dash.clone()), PlaybackSettings::DESPAWN));
+        }
         player.dash_timer = player.config.dash_duration;
         player.dash_cooldown = player.config.dash_cooldown_max;
         player.invulnerability_timer = player.config.dash_duration;
@@ -250,7 +289,7 @@ fn player_input_and_movement_system(
     let jump_pressed = keyboard.just_pressed(KeyCode::KeyW) || keyboard.just_pressed(KeyCode::Space) || keyboard.just_pressed(KeyCode::ArrowUp);
     let jump_held = keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::Space) || keyboard.pressed(KeyCode::ArrowUp);
 
-    let (new_vy, new_coyote, new_buffer, _) = step_vertical_velocity(
+    let (new_vy, new_coyote, new_buffer, did_jump) = step_vertical_velocity(
         player.velocity.y,
         player.is_grounded,
         jump_held,
@@ -263,6 +302,11 @@ fn player_input_and_movement_system(
     player.velocity.y = new_vy;
     player.coyote_timer = new_coyote;
     player.jump_buffer_timer = new_buffer;
+    if did_jump {
+        if let Some(ref sfx) = audio {
+            commands.spawn((AudioPlayer::new(sfx.jump.clone()), PlaybackSettings::DESPAWN));
+        }
+    }
 
     // 5. Apply velocities
     let prev_y = transform.translation.y;
@@ -303,6 +347,7 @@ fn player_katana_slash_system(
     cursor: Res<CursorWorldCoords>,
     mut player_q: Query<(&Transform, &mut Player), Without<Enemy>>,
     enemies_q: Query<(Entity, &Transform, &Enemy), Without<Player>>,
+    audio: Option<Res<GameAudioAssets>>,
     mut slice_events: EventWriter<SliceEnemyEvent>,
     mut commands: Commands,
 ) {
@@ -316,6 +361,9 @@ fn player_katana_slash_system(
 
     if mouse_buttons.just_pressed(MouseButton::Left) && player.slash_cooldown <= 0.0 {
         player.slash_cooldown = 0.22;
+        if let Some(ref sfx) = audio {
+            commands.spawn((AudioPlayer::new(sfx.slash.clone()), PlaybackSettings::DESPAWN));
+        }
         let origin = p_transform.translation.xy() + Vec2::new(0.0, 16.0);
 
         let aim_dir = if let Some(cursor_pos) = cursor.0 {
@@ -365,6 +413,7 @@ fn player_chrono_warp_system(
     cursor: Res<CursorWorldCoords>,
     mut player_q: Query<(&mut Transform, &mut Player, &mut ChronoEnergy), Without<Enemy>>,
     enemies_q: Query<(Entity, &Transform, &Enemy), Without<Player>>,
+    audio: Option<Res<GameAudioAssets>>,
     mut slice_events: EventWriter<SliceEnemyEvent>,
     mut commands: Commands,
 ) {
@@ -389,6 +438,9 @@ fn player_chrono_warp_system(
         energy.consume_teleport();
         player.warp_cooldown = 0.20;
         player.invulnerability_timer = 0.25;
+        if let Some(ref sfx) = audio {
+            commands.spawn((AudioPlayer::new(sfx.warp.clone()), PlaybackSettings::DESPAWN));
+        }
 
         let start_pos = p_transform.translation.xy();
         let warp_vector = cursor_pos - start_pos;
@@ -472,6 +524,7 @@ pub fn slice_event_resolution_system(
     mut wave_mgr: ResMut<WaveManager>,
     mut player_q: Query<&mut ChronoEnergy>,
     enemies_q: Query<(&Enemy, &Transform)>,
+    audio: Option<Res<GameAudioAssets>>,
     mut commands: Commands,
 ) {
     let mut processed = std::collections::HashSet::new();
@@ -494,6 +547,9 @@ pub fn slice_event_resolution_system(
         let shake = if ev.is_warp_kill { 12.0 } else { 7.0 };
         chrono.trigger_hitstop(hitstop);
         chrono.trigger_shake(shake);
+        if let Some(ref sfx) = audio {
+            commands.spawn((AudioPlayer::new(sfx.slice_kill.clone()), PlaybackSettings::DESPAWN));
+        }
 
         // 2. Score & Combo
         combo.register_kill(ev.is_warp_kill);

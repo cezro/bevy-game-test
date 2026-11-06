@@ -17,6 +17,9 @@ bevy = { version = "0.15.0", default-features = false, features = [
     "tonemapping_luts",
     "multi_threaded",
     "png",
+    "bevy_audio",
+    "wav",
+    "vorbis",
 ] }
 rand = "0.8"
 
