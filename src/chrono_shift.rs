@@ -283,19 +283,35 @@ impl GearAcclimatization {
     }
 
     /// Burnout energy drain multiplier for the active gear.
-    /// Once you master the previous gear (`mastered_tier >= idx - 1`), you do NOT burn out the next (returns 1.0).
-    /// If skipped ahead without mastering the previous gear (`idx - 1 > mastered_tier`), apply absurd burnout drain rate!
+    /// Mastered gears (`idx <= mastered_tier`) have near-zero consumption (0.05x multiplier).
+    /// The next gear higher (`idx == mastered_tier + 1`) has NO burnout:
+    /// - For G1/G2: 1.0x baseline drain.
+    /// - For G3+: scaled so consumption matches initial Gear 2 consumption (`drain_for_dilation(G2) / drain_for_dilation(G)`).
+    /// Skipped higher gears (`idx > mastered_tier + 1`) suffer burnout penalty,
+    /// alleviated by 0.8 per mastered tier as familiarity deepens.
     pub fn burnout_multiplier(&self, active_gear: Gear) -> f32 {
         let idx = active_gear.index();
         if idx == 0 {
             return 1.0;
         }
-        let tol = self.tolerance[idx];
-        if self.mastered_tier >= idx - 1 {
-            1.0
+        if idx <= self.mastered_tier {
+            0.05
+        } else if idx == self.mastered_tier + 1 {
+            if idx <= 2 {
+                1.0
+            } else {
+                let denom = drain_for_dilation(active_gear.dilation());
+                if denom > 1e-4 {
+                    drain_for_dilation(Gear::G2.dilation()) / denom
+                } else {
+                    1.0
+                }
+            }
         } else {
-            let skipped = (idx - 1 - self.mastered_tier) as f32;
-            2.5 + skipped * 2.0 + (1.0 - tol) * 2.0
+            let skipped = (idx.saturating_sub(self.mastered_tier + 1)) as f32;
+            let relief = self.mastered_tier as f32 * 0.8;
+            let tol = finite_or(self.tolerance[idx], 0.0).clamp(0.0, 1.0);
+            (2.5 + skipped * 2.0 + (1.0 - tol) * 2.0 - relief).max(1.5)
         }
     }
 
@@ -1808,7 +1824,8 @@ mod tests {
             assert!((chrono.dilation_factor - 0.24).abs() < 0.02, "smoothing converges");
             let s = app.world().resource::<ChronoShifter>();
             assert!(s.is_held() && s.aim_frozen());
-            assert!((s.drain_per_sec - drain_for_dilation(0.24)).abs() < 1e-3);
+            assert!((s.base_drain_per_sec - drain_for_dilation(0.24)).abs() < 1e-3);
+            assert!((s.drain_per_sec - drain_for_dilation(0.24) * 0.05).abs() < 1e-3);
         }
         assert!(energy(&mut app) < 100.0);
 
@@ -1870,15 +1887,16 @@ mod tests {
         for w in loss.windows(2) {
             assert!(w[1] > w[0], "drain not increasing: {loss:?}");
         }
-        // Gear 6 over 30 frames of 16ms ≈ 69/s * 0.48s ≈ 33.
-        assert!((loss[3] - drain_for_dilation(0.04) * 0.48).abs() < 1.0, "{loss:?}");
+        // Gear 6 over 30 frames of 16ms with mastered tier 6 (0.05x drain) ≈ 69/s * 0.05 * 0.48s ≈ 1.65.
+        assert!((loss[3] - drain_for_dilation(0.04) * 0.05 * 0.48).abs() < 1.0, "{loss:?}");
     }
 
     #[test]
     fn app_meter_stalls_at_zero() {
         let mut app = test_app();
         engage(&mut app, KeyCode::Digit6);
-        set_energy(&mut app, 2.0);
+        // At mastered tier 6 (0.05x drain = 3.45/s), 0.2 energy drains to 0 within 10 frames (0.16s)
+        set_energy(&mut app, 0.2);
         run(&mut app, 10);
         assert!(app.world().resource::<ChronoShifter>().model.stalled);
         run(&mut app, 30);
@@ -2218,8 +2236,8 @@ mod tests {
         engage(&mut app, KeyCode::Digit6);
         assert!((app.world().resource::<ChronoState>().slowmo_factor - 0.04).abs() < 1e-4);
 
-        // Set energy to 28.0 (absorbs 1 frame of Gear 6 drain (~1.1) and 1 warp of 25.0 cost, leaving < 2.0)
-        set_energy(&mut app, 28.0);
+        // Set energy to 25.1 (absorbs 1 warp of 25.0 cost, leaving 0.1 which depletes to 0 via Gear 6 drain)
+        set_energy(&mut app, 25.1);
 
         // Set frozen aim on the shifter so cursor remains pinned to (200.0, 0.0) while held
         app.world_mut().resource_mut::<ChronoShifter>().frozen_aim = Some(Vec2::new(200.0, 0.0));
@@ -2264,7 +2282,8 @@ mod tests {
         assert!(accl.on_flawless_kill(Gear::G1, 1));
         assert_eq!(accl.mastered_tier, 1);
         assert!(accl.is_mastered(Gear::G1));
-        assert_eq!(accl.burnout_multiplier(Gear::G1), 1.0);
+        // Mastered gear has near-zero consumption (0.05x multiplier)!
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 0.05);
         assert_eq!(accl.flawless_streak, 2);
         assert!(accl.feedback_banner.contains("GEAR 1 MASTERED"));
 
@@ -2276,7 +2295,8 @@ mod tests {
         assert!(accl.on_flawless_kill(Gear::G2, 1));
         assert_eq!(accl.mastered_tier, 2);
         assert!(accl.is_mastered(Gear::G2));
-        assert_eq!(accl.burnout_multiplier(Gear::G2), 1.0);
+        // Mastered gear 2 has near-zero consumption (0.05x multiplier)!
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 0.05);
     }
 
     #[test]
@@ -2352,17 +2372,39 @@ mod tests {
         let burnout_drain = base_g6 * accl.burnout_multiplier(Gear::G6);
         assert!(burnout_drain > 1000.0, "Drain must exceed 1000/s on unmastered Gear 6!");
 
-        // Once Gear 1 is mastered, Gear 2 now has ZERO burnout (1.0x baseline drain)!
+        // Once Gear 1 is mastered:
         accl.on_flawless_kill(Gear::G1, 2);
         assert_eq!(accl.mastered_tier, 1);
+        // Mastered gear 1 has near zero consumption (0.05x)!
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 0.05);
+        // 1 Next Gear Higher (Gear 2) has ZERO burnout (1.0x baseline drain)!
         assert_eq!(accl.burnout_multiplier(Gear::G2), 1.0);
-        // But Gear 3 is still skipped (mastered_tier 1 < 3 - 1 = 2, skipped = 1): 2.5 + 2.0 + 2.0 = 6.5x
-        assert_eq!(accl.burnout_multiplier(Gear::G3), 6.5);
+        // Higher skipped Gear 3 burnout is lowered: 2.5 + (3 - 1 - 1)*2.0 + (1.0 - 0.0)*2.0 - 0.8 = 5.7x (lower than 8.5x!)
+        assert!((accl.burnout_multiplier(Gear::G3) - 5.7).abs() < 1e-4);
+        assert!(accl.burnout_multiplier(Gear::G3) < 8.5);
+
+        // Once Gear 2 is mastered:
+        accl.on_flawless_kill(Gear::G2, 3);
+        assert_eq!(accl.mastered_tier, 2);
+        // Mastered gear 2 has near zero consumption (0.05x)!
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 0.05);
+        // Gear 3 (1 next gear higher) MUST NOT burn out:
+        // And "at mastery of gear 2, the gear 3 should be consuming as much as gear 2 did initially":
+        let g3_mult = accl.burnout_multiplier(Gear::G3);
+        let g3_drain = drain_for_dilation(Gear::G3.dilation()) * g3_mult;
+        let g2_init_drain = drain_for_dilation(Gear::G2.dilation());
+        assert!((g3_drain - g2_init_drain).abs() < 1e-4, "Gear 3 drain must equal Gear 2 initial drain!");
+        assert!(g3_mult <= 1.0, "1 Next Gear Higher must not burn out!");
+
+        // Higher skipped gears (e.g. G4, G5, G6) have burnout lowered even further:
+        // G4 (skipped 1, relief 1.6): 2.5 + 2.0 + 2.0 - 1.6 = 4.9x (lower than 7.7x at tier 1)
+        assert!((accl.burnout_multiplier(Gear::G4) - 4.9).abs() < 1e-4);
+        assert!(accl.burnout_multiplier(Gear::G4) < 7.7);
 
         // Killing enemies while skipping tiers grants only partial familiarity (capped at 0.50)
         accl.on_flawless_kill(Gear::G6, 10);
         assert!(accl.tolerance[6] <= 0.50);
-        assert_eq!(accl.mastered_tier, 1); // Cannot skip prerequisite gears
+        assert_eq!(accl.mastered_tier, 2); // Cannot skip prerequisite gears
         assert!(accl.feedback_banner.contains("MASTER G5 FIRST"));
     }
 
@@ -2503,6 +2545,59 @@ mod tests {
             let chrono = app.world().resource::<ChronoState>();
             assert!((chrono.slowmo_factor - 0.75).abs() < 1e-4);
             assert!(chrono.is_dilating);
+        }
+    }
+
+    #[test]
+    fn test_mastery_near_zero_and_gear3_matches_gear2_initial_drain_positive_proof() {
+        let mut accl = GearAcclimatization::default();
+
+        // 1. Initial state (mastered_tier = 0, Neutral only)
+        assert_eq!(accl.burnout_multiplier(Gear::N), 1.0);
+        // Next gear higher (Gear 1) has 1.0 multiplier (no burnout)
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 1.0);
+        // Skipped Gear 2 burnout: 6.5
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 6.5);
+
+        // 2. Master Gear 1
+        accl.mastered_tier = 1;
+        accl.tolerance[1] = 1.0;
+        // Gear 1 mastered -> near zero consumption (0.05x multiplier)
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 0.05);
+        let g1_drain = drain_for_dilation(Gear::G1.dilation()) * accl.burnout_multiplier(Gear::G1);
+        assert!((g1_drain - drain_for_dilation(Gear::G1.dilation()) * 0.05).abs() < 1e-4);
+
+        // 1 Next gear higher (Gear 2) has 1.0x baseline drain (no burnout)
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 1.0);
+        let g2_initial_drain = drain_for_dilation(Gear::G2.dilation()) * accl.burnout_multiplier(Gear::G2);
+        assert_eq!(g2_initial_drain, drain_for_dilation(Gear::G2.dilation()));
+
+        // 3. Master Gear 2
+        accl.mastered_tier = 2;
+        accl.tolerance[2] = 1.0;
+        // Gear 1 and Gear 2 are both mastered -> near zero consumption (0.05x multiplier)
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 0.05);
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 0.05);
+        let g2_mastered_drain = drain_for_dilation(Gear::G2.dilation()) * accl.burnout_multiplier(Gear::G2);
+        assert!((g2_mastered_drain - drain_for_dilation(Gear::G2.dilation()) * 0.05).abs() < 1e-4);
+
+        // 4. "at mastery of gear 2, the gear 3 should be consuming as much as gear 2 did initially"
+        let g3_mult = accl.burnout_multiplier(Gear::G3);
+        let g3_drain = drain_for_dilation(Gear::G3.dilation()) * g3_mult;
+        assert!((g3_drain - g2_initial_drain).abs() < 1e-4, "Gear 3 drain at M2 must match Gear 2 initial drain!");
+        // And Gear 3 does not burn out
+        assert!(g3_mult <= 1.0, "Gear 3 must not burn out at M2");
+
+        // 5. Higher gears burnout strictly decreases with every mastered gear
+        for gear in [Gear::G4, Gear::G5, Gear::G6] {
+            let mut previous_burnout = 999.0f32;
+            let mut a = GearAcclimatization::default();
+            for tier in 0..gear.index().saturating_sub(1) {
+                a.mastered_tier = tier;
+                let mult = a.burnout_multiplier(gear);
+                assert!(mult < previous_burnout, "Burnout for {:?} must decrease when tier increases to {}", gear, tier);
+                previous_burnout = mult;
+            }
         }
     }
 }

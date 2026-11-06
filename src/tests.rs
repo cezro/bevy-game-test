@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn test_burnout_multiplier_mastered_previous_tier_vs_skip() {
-        use crate::chrono_shift::{Gear, GearAcclimatization};
+        use crate::chrono_shift::{drain_for_dilation, Gear, GearAcclimatization};
 
         let mut accl = GearAcclimatization::default();
         // At tier 0: Neutral is mastered, so Gear 1 has ZERO burnout multiplier (1.0x tolerable drain)
@@ -634,12 +634,26 @@ mod tests {
         accl.on_flawless_kill(Gear::G1, 2);
         assert_eq!(accl.mastered_tier, 1);
 
-        // Now Gear 2 has previous gear (G1) mastered -> returns 1.0 (ZERO burnout!)
+        // Mastered Gear 1 now has near-zero consumption (0.05x)!
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 0.05);
+        // Now Gear 2 is 1 next higher -> returns 1.0 (ZERO burnout!)
         assert_eq!(accl.burnout_multiplier(Gear::G2), 1.0);
-        // Gear 1 itself is also mastered -> returns 1.0
-        assert_eq!(accl.burnout_multiplier(Gear::G1), 1.0);
-        // Gear 3 is still skipped (1 < 3 - 1) -> 2.5 + 2.0 + 2.0 = 6.5
-        assert_eq!(accl.burnout_multiplier(Gear::G3), 6.5);
+        // Gear 3 is still skipped at tier 1: 2.5 + (3 - 1 - 1)*2.0 + (1.0 - 0.0)*2.0 - 0.8 = 5.7 (lowered!)
+        assert!((accl.burnout_multiplier(Gear::G3) - 5.7).abs() < 1e-4);
+
+        // Master Gear 2
+        accl.on_flawless_kill(Gear::G2, 3);
+        assert_eq!(accl.mastered_tier, 2);
+        // Mastered Gear 2 now has near-zero consumption (0.05x)!
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 0.05);
+
+        // Gear 3 is 1 next higher at tier 2:
+        // "at mastery of gear 2, the gear 3 should be consuming as much as gear 2 did initially"
+        let g3_mult = accl.burnout_multiplier(Gear::G3);
+        let g3_drain = drain_for_dilation(Gear::G3.dilation()) * g3_mult;
+        let g2_init_drain = drain_for_dilation(Gear::G2.dilation());
+        assert!((g3_drain - g2_init_drain).abs() < 1e-4, "Gear 3 drain at M2 must equal Gear 2 initial drain");
+        assert!(g3_mult <= 1.0, "1 Next Gear Higher must not burn out!");
     }
 
     #[test]
@@ -1400,7 +1414,7 @@ mod tests {
 
     #[test]
     fn test_adversarial_burnout_exhaustive_matrix_and_overflow_protection() {
-        use crate::chrono_shift::{Gear, GearAcclimatization};
+        use crate::chrono_shift::{drain_for_dilation, Gear, GearAcclimatization};
 
         let gears = [
             Gear::N,
@@ -1420,17 +1434,27 @@ mod tests {
             for g in gears.iter() {
                 let mult = accl.burnout_multiplier(*g);
                 assert!(mult.is_finite(), "Multiplier must be finite for {:?} at tier {}", g, m_tier);
-                assert!(mult >= 1.0, "Multiplier must be at least 1.0 baseline for {:?} at tier {}", g, m_tier);
+                assert!(mult > 0.0, "Multiplier must be positive for {:?} at tier {}", g, m_tier);
 
                 let idx = g.index();
                 if idx == 0 {
                     assert_eq!(mult, 1.0, "Neutral gear must always have 1.0 multiplier!");
-                } else if m_tier >= idx - 1 {
-                    assert_eq!(mult, 1.0, "Gear {} must have 1.0 multiplier when tier {} >= {} - 1", idx, m_tier, idx);
+                } else if idx <= m_tier {
+                    assert_eq!(mult, 0.05, "Gear {} must have 0.05 multiplier when mastered (tier {})", idx, m_tier);
+                } else if idx == m_tier + 1 {
+                    if idx <= 2 {
+                        assert_eq!(mult, 1.0, "Gear {} at tier {} (<= 2) must have 1.0 multiplier", idx, m_tier);
+                    } else {
+                        let expected = drain_for_dilation(Gear::G2.dilation()) / drain_for_dilation(g.dilation());
+                        assert!((mult - expected).abs() < 1e-4, "Gear {} at tier {} matches Gear 2 initial consumption", idx, m_tier);
+                    }
+                    assert!(mult <= 1.0, "1 Next higher gear must not burn out!");
                 } else {
                     let skipped = (idx - 1 - m_tier) as f32;
-                    let expected = 2.5 + skipped * 2.0 + (1.0 - accl.tolerance[idx]) * 2.0;
+                    let relief = m_tier as f32 * 0.8;
+                    let expected = (2.5 + skipped * 2.0 + (1.0 - accl.tolerance[idx]) * 2.0 - relief).max(1.5);
                     assert!((mult - expected).abs() < 1e-4, "Burnout formula match for Gear {} at tier {}", idx, m_tier);
+                    assert!(mult >= 1.5, "Skipped higher gear burnout must be at least 1.5");
                 }
             }
         }
@@ -1459,5 +1483,227 @@ mod tests {
         // Tolerance recovery: flawless kill restores tolerance
         accl.on_flawless_kill(Gear::G3, 1);
         assert!(accl.tolerance[3] > 0.0, "Tolerance recovers on flawless kill!");
+    }
+
+    #[test]
+    fn test_adversarial_disprover_burnout_falsification_suite() {
+        use crate::chrono_shift::{
+            drain_for_dilation, ChronoShiftCorePlugin, ChronoShifter, Gear,
+            GearAcclimatization,
+        };
+        use crate::player::{ChronoEnergy, Player};
+        use bevy::prelude::*;
+
+        // 1. Precise Floating Point Delta Verification:
+        // "at mastery of gear 2, the gear 3 should be consuming as much as gear 2 did initially"
+        // Target: Verify floating point delta <= 1e-5 (strict red-team check).
+        {
+            let mut accl = GearAcclimatization::default();
+            accl.mastered_tier = 2;
+            let g3_mult = accl.burnout_multiplier(Gear::G3);
+            let g3_base = drain_for_dilation(Gear::G3.dilation());
+            let g3_drain = g3_base * g3_mult;
+            let g2_init_drain = drain_for_dilation(Gear::G2.dilation());
+
+            let diff = (g3_drain - g2_init_drain).abs();
+            assert!(
+                diff <= 1e-5,
+                "Gear 3 drain at M2 ({g3_drain}) must match Gear 2 initial drain ({g2_init_drain}) within 1e-5 (actual diff: {diff})"
+            );
+            assert!(g3_mult <= 1.0, "1 Next higher gear must not burn out! Got mult: {g3_mult}");
+        }
+
+        // 2. Next Gear Higher (mastered_tier + 1) NEVER burns out for all tiers:
+        for tier in 0..=5 {
+            let mut accl = GearAcclimatization::default();
+            accl.mastered_tier = tier;
+            let next_gear = Gear::from_index((tier + 1) as i32);
+            let mult = accl.burnout_multiplier(next_gear);
+            assert!(
+                mult <= 1.0,
+                "Tier {tier} next gear {next_gear:?} multiplier {mult} must be <= 1.0 (no burnout)"
+            );
+            assert!(
+                mult > 0.0,
+                "Tier {tier} next gear {next_gear:?} multiplier {mult} must be positive"
+            );
+            // Verify burnout status flag is false
+            let is_burnout = mult > 1.05;
+            assert!(!is_burnout, "Tier {tier} next gear must NOT trigger is_burnout");
+        }
+
+        // 3. Monotonic decrease of burnout multiplier on higher gears as mastered_tier advances:
+        for active_idx in 2..=6 {
+            let active_gear = Gear::from_index(active_idx as i32);
+            for tol_val in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+                let mut prev_mult = f32::INFINITY;
+                for tier in 0..active_idx {
+                    let mut accl = GearAcclimatization::default();
+                    accl.mastered_tier = tier;
+                    accl.tolerance[active_idx] = tol_val;
+                    let mult = accl.burnout_multiplier(active_gear);
+
+                    assert!(
+                        mult < prev_mult,
+                        "Burnout multiplier for {active_gear:?} at tol {tol_val} must strictly decrease when tier increases from {} to {} (prev: {prev_mult}, curr: {mult})",
+                        tier.saturating_sub(1),
+                        tier
+                    );
+                    prev_mult = mult;
+                }
+            }
+        }
+
+        // 4. Extreme / Out-of-bounds mastered_tier fuzzing (tier 6, 7, 10, 255, usize::MAX):
+        for extreme_tier in [6, 7, 10, 255, usize::MAX] {
+            let mut accl = GearAcclimatization::default();
+            accl.mastered_tier = extreme_tier;
+
+            // Neutral must always be 1.0
+            assert_eq!(accl.burnout_multiplier(Gear::N), 1.0);
+
+            // All valid gears 1..=6 are <= extreme_tier, so all must return 0.05 (near zero)
+            for g in &Gear::ALL[1..] {
+                let mult = accl.burnout_multiplier(*g);
+                assert_eq!(
+                    mult, 0.05,
+                    "Gear {g:?} with extreme tier {extreme_tier} must have near-zero (0.05) consumption"
+                );
+            }
+        }
+
+        // 5. Massive direct skip from Neutral (tier 0) to Gear 6:
+        // Verify drain strictly exceeds 1000/s:
+        {
+            let accl = GearAcclimatization::default(); // tier 0
+            let g6_mult = accl.burnout_multiplier(Gear::G6);
+            let g6_base = drain_for_dilation(Gear::G6.dilation());
+            let g6_drain = g6_base * g6_mult;
+
+            // Base drain = 75 * (1 - 0.04)^2 = 69.12
+            // Skipped = 6 - 1 = 5 -> 2.5 + 5*2.0 + 2.0 = 14.5
+            // Total drain = 69.12 * 14.5 = 1002.24 > 1000.0/s
+            assert!((g6_base - 69.12).abs() < 1e-2);
+            assert!((g6_mult - 14.5).abs() < 1e-4);
+            assert!(
+                g6_drain > 1000.0,
+                "Direct skip to Gear 6 must exceed 1000/s drain! Actual: {g6_drain}"
+            );
+        }
+
+        // 6. Tolerance corruption stress test (negative, oversized, extreme):
+        for corrupt_tol in [-10.0f32, -1.0, 2.0, 50.0] {
+            let mut accl = GearAcclimatization::default();
+            accl.mastered_tier = 0;
+            accl.tolerance[5] = corrupt_tol;
+            let mult = accl.burnout_multiplier(Gear::G5);
+            assert!(mult.is_finite(), "Multiplier must remain finite under corrupt tol");
+            assert!(
+                mult >= 1.5,
+                "Corrupt tol must not drop skipped gear multiplier below 1.5 clamp"
+            );
+        }
+
+        // 7. Full Bevy ECS Control System and HUD Consistency Test:
+        {
+            use crate::time_control::update_chrono_system;
+            use bevy::input::keyboard::KeyboardInput;
+            use bevy::input::ButtonState;
+            use bevy::input::InputPlugin;
+            use bevy::time::TimeUpdateStrategy;
+            use std::time::Duration;
+
+            let mut app = App::new();
+            app.add_plugins((MinimalPlugins, InputPlugin))
+                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(16)))
+                .init_resource::<crate::time_control::ChronoState>()
+                .init_resource::<crate::CursorWorldCoords>()
+                .add_plugins(ChronoShiftCorePlugin)
+                .add_systems(Update, update_chrono_system);
+
+            let _player_ent = app.world_mut().spawn((
+                Player::default(),
+                ChronoEnergy::default(),
+                Transform::default(),
+            )).id();
+
+            // Setup acclimatization: Mastered tier = 2
+            {
+                let mut shifter = app.world_mut().resource_mut::<ChronoShifter>();
+                shifter.acclimatization.mastered_tier = 2;
+                shifter.acclimatization.tolerance[1] = 1.0;
+                shifter.acclimatization.tolerance[2] = 1.0;
+            }
+
+            // Command Shift + 3 (Jump to Gear 3)
+            app.world_mut().send_event(KeyboardInput {
+                key_code: KeyCode::ShiftLeft,
+                logical_key: bevy::input::keyboard::Key::Unidentified(bevy::input::keyboard::NativeKey::Unidentified),
+                state: ButtonState::Pressed,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+            app.world_mut().send_event(KeyboardInput {
+                key_code: KeyCode::Digit3,
+                logical_key: bevy::input::keyboard::Key::Unidentified(bevy::input::keyboard::NativeKey::Unidentified),
+                state: ButtonState::Pressed,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+
+            // Step for multiple frames so knob reaches detent seat
+            for _ in 0..40 {
+                app.update();
+            }
+
+            let shifter = app.world().resource::<ChronoShifter>();
+            assert_eq!(shifter.model.last_seat, Some(Gear::G3));
+            assert!(shifter.burnout_multiplier <= 1.0, "Gear 3 at tier 2 must not burn out");
+            assert!(
+                (shifter.burnout_multiplier - (drain_for_dilation(Gear::G2.dilation()) / drain_for_dilation(Gear::G3.dilation()))).abs() < 1e-4
+            );
+            assert!(
+                (shifter.drain_per_sec - drain_for_dilation(Gear::G2.dilation())).abs() < 1e-4,
+                "In-game drain_per_sec ({}) must match Gear 2 initial drain ({})",
+                shifter.drain_per_sec,
+                drain_for_dilation(Gear::G2.dilation())
+            );
+            assert_eq!(
+                shifter.drain_per_sec,
+                shifter.base_drain_per_sec * shifter.burnout_multiplier,
+                "drain_per_sec must equal base_drain * burnout_mult"
+            );
+
+            // Now test skipping directly to Gear 6 in the same app at tier 0:
+            {
+                let mut shifter = app.world_mut().resource_mut::<ChronoShifter>();
+                shifter.acclimatization.mastered_tier = 0;
+            }
+            app.world_mut().send_event(KeyboardInput {
+                key_code: KeyCode::Digit6,
+                logical_key: bevy::input::keyboard::Key::Unidentified(bevy::input::keyboard::NativeKey::Unidentified),
+                state: ButtonState::Pressed,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+
+            let mut stalled_seen = false;
+            let mut burnout_mult_seen = 0.0f32;
+            let mut max_drain_seen = 0.0f32;
+
+            for _ in 0..40 {
+                app.update();
+                let s = app.world().resource::<ChronoShifter>();
+                if s.model.stalled {
+                    stalled_seen = true;
+                }
+                burnout_mult_seen = burnout_mult_seen.max(s.burnout_multiplier);
+                max_drain_seen = max_drain_seen.max(s.drain_per_sec);
+            }
+
+            assert!(burnout_mult_seen > 1.05);
+            assert!(max_drain_seen > 1000.0);
+            assert!(stalled_seen, "Massive drain of >1000/s must rapidly stall the 100 max energy meter!");
+        }
     }
 }
