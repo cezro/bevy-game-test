@@ -14,8 +14,8 @@ mod tests;
 
 use time_control::{ChronoState, update_chrono_system};
 use player::{Player, ChronoEnergy, Platform, step_horizontal_velocity, step_vertical_velocity};
-use combat::{ComboState, SliceEnemyEvent, SlashArcVisual, WarpBeamVisual, segment_intersects_circle, katana_arc_intersects};
-use enemy::{Enemy, EnemyState, EnemyType, WaveManager, WaveAction, step_enemy_ai};
+use combat::{ComboState, SliceEnemyEvent, SlashArcVisual, WarpBeamVisual, segment_intersects_circle, katana_arc_intersects, Bullet};
+use enemy::{Enemy, EnemyState, EnemyType, WaveManager, WaveAction, WavePhase, step_enemy_ai};
 use ragdoll::{RagdollPiece, RagdollPart, SliceParticle, calculate_slice_split_velocities, update_ragdoll_physics};
 use render::{render_game_gizmos, GhostTrail, generate_stickman_pose};
 use ui::{setup_ui, update_ui_system};
@@ -78,6 +78,7 @@ fn main() {
                 player_katana_slash_system,
                 player_chrono_warp_system,
                 enemy_ai_system,
+                bullet_system,
                 wave_manager_system,
                 slice_event_resolution_system,
                 update_visual_fx_system,
@@ -85,7 +86,7 @@ fn main() {
                 update_camera_shake_system,
                 update_ui_system,
                 game_restart_system,
-            ),
+            ).chain(),
         )
         .add_systems(PostUpdate, render_game_gizmos)
         .run();
@@ -330,12 +331,13 @@ pub fn player_input_and_movement_system(
 
 pub fn player_katana_slash_system(
     _time: Res<Time<Real>>,
-    chrono: Res<ChronoState>,
+    mut chrono: ResMut<ChronoState>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     cursor: Res<CursorWorldCoords>,
     shifter: Option<Res<ChronoShifter>>,
-    mut player_q: Query<(&Transform, &mut Player), Without<Enemy>>,
+    mut player_q: Query<(&Transform, &mut Player), (Without<Enemy>, Without<Bullet>)>,
     enemies_q: Query<(Entity, &Transform, &Enemy), Without<Player>>,
+    mut bullets_q: Query<(Entity, &Transform, &mut Bullet), Without<Player>>,
     audio: Option<Res<GameAudioAssets>>,
     mut slice_events: EventWriter<SliceEnemyEvent>,
     mut accuracy_events: EventWriter<CombatAccuracyEvent>,
@@ -383,12 +385,12 @@ pub fn player_katana_slash_system(
             color: Color::srgba(0.2, 0.95, 1.0, 1.0),
         });
 
-        // Check enemies hit by katana slash
-        let mut hit_count = 0;
+        // 1. Check enemies hit by katana slash
+        let mut hit_enemy_count = 0;
         for (e_entity, e_transform, enemy) in enemies_q.iter() {
             let enemy_center = e_transform.translation.xy() + Vec2::new(0.0, 16.0);
             if katana_arc_intersects(origin, player.facing, aim_dir, enemy_center, slash_range, arc_span, enemy.hitbox_radius) {
-                hit_count += 1;
+                hit_enemy_count += 1;
                 let slice_dir = aim_dir;
                 let impulse = aim_dir * 320.0 + Vec2::new(0.0, 180.0);
                 slice_events.send(SliceEnemyEvent {
@@ -401,8 +403,48 @@ pub fn player_katana_slash_system(
             }
         }
 
-        if hit_count > 0 {
-            accuracy_events.send(CombatAccuracyEvent::FlawlessKill { count: hit_count, is_warp: false });
+        // 2. Check bullets slashed by katana
+        let mut hit_bullet_count = 0;
+        for (b_entity, b_transform, mut bullet) in bullets_q.iter_mut() {
+            let bullet_pos = b_transform.translation.xy();
+            if katana_arc_intersects(origin, player.facing, aim_dir, bullet_pos, slash_range, arc_span, bullet.radius) {
+                hit_bullet_count += 1;
+                // Zero out damage and lifetime immediately to prevent race conditions with bullet_system
+                bullet.damage = 0.0;
+                bullet.lifetime = 0.0;
+                commands.entity(b_entity).despawn();
+
+                // Spawn neon deflection sparks
+                for k in 0..6 {
+                    let angle = (k as f32 / 6.0) * std::f32::consts::TAU;
+                    let spark_vel = Vec2::new(angle.cos(), angle.sin()) * 200.0;
+                    commands.spawn((
+                        SliceParticle {
+                            velocity: spark_vel,
+                            lifetime: 0.18,
+                            max_lifetime: 0.18,
+                            color: Color::srgba(0.2, 0.95, 1.0, 1.0),
+                            size: 4.0,
+                            gravity_scale: 0.5,
+                        },
+                        Transform::from_translation(Vec3::new(bullet_pos.x, bullet_pos.y, 7.0)),
+                    ));
+                }
+            }
+        }
+
+        let total_hits = hit_enemy_count + hit_bullet_count;
+        if total_hits > 0 {
+            // Rapid chaining: reduce slash cooldown when hitting an enemy OR a bullet!
+            player.slash_cooldown = 0.04;
+            if hit_bullet_count > 0 && hit_enemy_count == 0 {
+                chrono.trigger_hitstop(0.04);
+                chrono.trigger_shake(4.0);
+                if let Some(ref sfx) = audio {
+                    commands.spawn((AudioPlayer::new(sfx.slash.clone()), PlaybackSettings::DESPAWN));
+                }
+            }
+            accuracy_events.send(CombatAccuracyEvent::FlawlessKill { count: total_hits, is_warp: false });
         } else {
             accuracy_events.send(CombatAccuracyEvent::Miss { is_warp: false });
         }
@@ -520,6 +562,8 @@ pub fn player_chrono_warp_system(
         }
 
         if hit_count > 0 {
+            // Rapid chaining of warp kills: reduce warp cooldown when hitting enemies!
+            player.warp_cooldown = 0.05;
             accuracy_events.send(CombatAccuracyEvent::FlawlessKill { count: hit_count, is_warp: true });
         } else {
             accuracy_events.send(CombatAccuracyEvent::Miss { is_warp: true });
@@ -580,6 +624,8 @@ pub fn slice_event_resolution_system(
             EnemyType::Runner => Color::srgba(0.85, 0.2, 0.2, 1.0),
             EnemyType::Ninja => Color::srgba(0.55, 0.1, 0.75, 1.0),
             EnemyType::Heavy => Color::srgba(0.85, 0.4, 0.1, 1.0),
+            EnemyType::GunnerSemi => Color::srgba(0.2, 0.8, 0.45, 1.0),
+            EnemyType::GunnerAuto => Color::srgba(0.95, 0.7, 0.1, 1.0),
         };
 
         // Upper Ragdoll
@@ -641,10 +687,12 @@ pub fn slice_event_resolution_system(
 fn enemy_ai_system(
     time: Res<Time<Real>>,
     chrono: Res<ChronoState>,
-    mut player_q: Query<(&Transform, &mut Player), Without<Enemy>>,
+    mut player_q: Query<(&Transform, &mut Player), (Without<Enemy>, Without<Bullet>)>,
     mut enemies_q: Query<(Entity, &mut Transform, &mut Enemy), Without<Player>>,
     platforms_q: Query<&Platform>,
+    audio: Option<Res<GameAudioAssets>>,
     mut accuracy_events: EventWriter<CombatAccuracyEvent>,
+    mut commands: Commands,
 ) {
     let dt = chrono.get_world_dt(time.delta_secs());
     if dt <= 0.0 {
@@ -718,27 +766,90 @@ fn enemy_ai_system(
             }
         }
 
-        // 5. Attack Hitbox Execution
+        // 5. Attack Execution
         let facing = enemy.facing;
         let attack_range = enemy.attack_range;
         let hitbox_radius = enemy.hitbox_radius;
         let damage = enemy.attack_damage;
+        let enemy_type = enemy.enemy_type;
 
         if let EnemyState::Attack { ref mut has_hit, .. } = enemy.state {
-            if !*has_hit {
-                let attack_center = enemy_pos + Vec2::new(facing * attack_range * 0.6, 12.0);
-                if (attack_center - (player_pos + Vec2::new(0.0, 16.0))).length() < (hitbox_radius + 20.0) {
+            let is_first_hit = !*has_hit;
+            if matches!(enemy_type, EnemyType::GunnerSemi | EnemyType::GunnerAuto) {
+                if is_first_hit {
                     *has_hit = true;
-                    if player.invulnerability_timer <= 0.0 {
-                        player.health = (player.health - damage).max(0.0);
-                        player.invulnerability_timer = 0.45;
-                        accuracy_events.send(CombatAccuracyEvent::TookDamage);
+                    // Initialize bullets for this burst attack
+                    enemy.bullets_to_fire = match enemy_type {
+                        EnemyType::GunnerSemi => 1,
+                        EnemyType::GunnerAuto => 4,
+                        _ => 1,
+                    };
+                    enemy.fire_cooldown = 0.0;
+                }
+            } else {
+                if is_first_hit {
+                    let attack_center = enemy_pos + Vec2::new(facing * attack_range * 0.6, 12.0);
+                    if (attack_center - (player_pos + Vec2::new(0.0, 16.0))).length() < (hitbox_radius + 20.0) {
+                        *has_hit = true;
+                        if player.invulnerability_timer <= 0.0 {
+                            player.health = (player.health - damage).max(0.0);
+                            player.invulnerability_timer = 0.45;
+                            accuracy_events.send(CombatAccuracyEvent::TookDamage);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Gunner bullet spawning (runs when in Attack state)
+        if matches!(enemy.state, EnemyState::Attack { .. })
+            && matches!(enemy_type, EnemyType::GunnerSemi | EnemyType::GunnerAuto)
+        {
+            if enemy.fire_cooldown > 0.0 {
+                enemy.fire_cooldown -= dt;
+            }
+
+            if enemy.bullets_to_fire > 0 && enemy.fire_cooldown <= 0.0 {
+                enemy.bullets_to_fire -= 1;
+                enemy.fire_cooldown = match enemy_type {
+                    EnemyType::GunnerAuto => 0.09,
+                    _ => 0.4,
+                };
+
+                    let muzzle = enemy_pos + Vec2::new(enemy.facing * 20.0, 14.0);
+                    let player_target = player_pos + Vec2::new(0.0, 16.0);
+                    let to_target = player_target - muzzle;
+                    let aim_dir = if to_target.length_squared() > 1.0 {
+                        to_target.normalize()
+                    } else {
+                        Vec2::new(enemy.facing, 0.0)
+                    };
+
+                    let (bullet_speed, bullet_damage, bullet_radius, is_auto) = match enemy_type {
+                        EnemyType::GunnerSemi => (540.0, 20.0, 6.0, false),
+                        EnemyType::GunnerAuto => (420.0, 10.0, 5.0, true),
+                        _ => (450.0, 15.0, 5.0, false),
+                    };
+
+                    commands.spawn((
+                        Bullet {
+                            velocity: aim_dir * bullet_speed,
+                            radius: bullet_radius,
+                            damage: bullet_damage,
+                            lifetime: 3.5,
+                            is_automatic: is_auto,
+                        },
+                        Transform::from_translation(Vec3::new(muzzle.x, muzzle.y, 6.0)),
+                        Visibility::default(),
+                    ));
+
+                    if let Some(ref sfx) = audio {
+                        commands.spawn((AudioPlayer::new(sfx.dash.clone()), PlaybackSettings::DESPAWN));
                     }
                 }
             }
         }
     }
-}
 
 fn wave_manager_system(
     time: Res<Time<Real>>,
@@ -746,7 +857,11 @@ fn wave_manager_system(
     mut wave_mgr: ResMut<WaveManager>,
     mut commands: Commands,
 ) {
-    let dt = chrono.get_world_dt(time.delta_secs());
+    // WaveCleared and Intermission advance in real time so transitions run without slow-mo lag!
+    let dt = match wave_mgr.phase {
+        WavePhase::WaveCleared { .. } | WavePhase::Intermission { .. } => time.delta_secs(),
+        _ => chrono.get_world_dt(time.delta_secs()),
+    };
     if dt <= 0.0 {
         return;
     }
@@ -763,6 +878,59 @@ fn wave_manager_system(
             }
             WaveAction::AnnounceWave(_) => {}
             WaveAction::AnnounceClear(_) => {}
+        }
+    }
+}
+
+pub fn bullet_system(
+    time: Res<Time<Real>>,
+    chrono: Res<ChronoState>,
+    mut bullets_q: Query<(Entity, &mut Transform, &mut Bullet)>,
+    mut player_q: Query<(&Transform, &mut Player), (Without<Bullet>, Without<Enemy>)>,
+    mut accuracy_events: EventWriter<CombatAccuracyEvent>,
+    mut commands: Commands,
+) {
+    // Bullets update using world dt (dilated by slow motion!)
+    let dt = chrono.get_world_dt(time.delta_secs());
+    if dt <= 0.0 {
+        return;
+    }
+
+    let Ok((p_transform, mut player)) = player_q.get_single_mut() else {
+        return;
+    };
+    let player_center = p_transform.translation.xy() + Vec2::new(0.0, 16.0);
+    let player_radius = 16.0;
+
+    for (b_entity, mut b_transform, mut bullet) in bullets_q.iter_mut() {
+        if bullet.lifetime <= 0.0 || bullet.damage <= 0.0 {
+            commands.entity(b_entity).despawn();
+            continue;
+        }
+
+        bullet.lifetime -= dt;
+        if bullet.lifetime <= 0.0 {
+            commands.entity(b_entity).despawn();
+            continue;
+        }
+
+        b_transform.translation.x += bullet.velocity.x * dt;
+        b_transform.translation.y += bullet.velocity.y * dt;
+
+        let b_pos = b_transform.translation.xy();
+        if b_pos.x.abs() > 650.0 || b_pos.y < -350.0 || b_pos.y > 450.0 {
+            commands.entity(b_entity).despawn();
+            continue;
+        }
+
+        // Damage player on contact
+        if (b_pos - player_center).length() < (bullet.radius + player_radius) {
+            if player.invulnerability_timer <= 0.0 {
+                player.health = (player.health - bullet.damage).max(0.0);
+                player.invulnerability_timer = 0.35;
+                accuracy_events.send(CombatAccuracyEvent::TookDamage);
+            }
+            commands.entity(b_entity).despawn();
         }
     }
 }
@@ -809,6 +977,7 @@ fn game_restart_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut player_q: Query<(&mut Transform, &mut Player, &mut ChronoEnergy)>,
     enemies_q: Query<Entity, With<Enemy>>,
+    bullets_q: Query<Entity, With<Bullet>>,
     ragdolls_q: Query<Entity, With<RagdollPiece>>,
     particles_q: Query<Entity, With<SliceParticle>>,
     mut wave_mgr: ResMut<WaveManager>,
@@ -825,9 +994,12 @@ fn game_restart_system(
             energy.current = 100.0;
         }
 
-        // Despawn all enemies, ragdolls, particles
+        // Despawn all enemies, bullets, ragdolls, particles
         for e in enemies_q.iter() {
             commands.entity(e).despawn();
+        }
+        for b in bullets_q.iter() {
+            commands.entity(b).despawn();
         }
         for r in ragdolls_q.iter() {
             commands.entity(r).despawn();

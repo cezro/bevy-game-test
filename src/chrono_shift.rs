@@ -283,19 +283,16 @@ impl GearAcclimatization {
     }
 
     /// Burnout energy drain multiplier for the active gear.
-    /// If mastered: 1.0 (baseline tolerable drain).
-    /// If in next tier: 1.0..=2.8x (mild adaptation drain).
-    /// If skipped ahead: 2.5x..=14.5x (absurd burnout drain rate!).
+    /// Once you master the previous gear (`mastered_tier >= idx - 1`), you do NOT burn out the next (returns 1.0).
+    /// If skipped ahead without mastering the previous gear (`idx - 1 > mastered_tier`), apply absurd burnout drain rate!
     pub fn burnout_multiplier(&self, active_gear: Gear) -> f32 {
         let idx = active_gear.index();
         if idx == 0 {
             return 1.0;
         }
         let tol = self.tolerance[idx];
-        if self.mastered_tier >= idx && tol >= 0.999 {
+        if self.mastered_tier >= idx - 1 {
             1.0
-        } else if self.mastered_tier == idx - 1 {
-            1.0 + (1.0 - tol) * 1.8
         } else {
             let skipped = (idx - 1 - self.mastered_tier) as f32;
             2.5 + skipped * 2.0 + (1.0 - tol) * 2.0
@@ -2253,14 +2250,15 @@ mod tests {
         let mut accl = GearAcclimatization::default();
         assert_eq!(accl.mastered_tier, 0);
         assert!(!accl.is_mastered(Gear::G1));
-        assert_eq!(accl.burnout_multiplier(Gear::G1), 2.8);
+        // Neutral (G0) is inherently mastered, so Gear 1 has ZERO burnout (1.0x baseline tolerable drain)
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 1.0);
 
         // Gear 1 requires 2 flawless kills to master
         assert!(!accl.on_flawless_kill(Gear::G1, 1));
         assert_eq!(accl.mastered_tier, 0);
         assert!((accl.tolerance[1] - 0.5).abs() < 1e-4);
         assert_eq!(accl.flawless_streak, 1);
-        assert!((accl.burnout_multiplier(Gear::G1) - 1.9).abs() < 1e-4);
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 1.0);
 
         // 2nd flawless kill completes Gear 1 mastery
         assert!(accl.on_flawless_kill(Gear::G1, 1));
@@ -2270,8 +2268,8 @@ mod tests {
         assert_eq!(accl.flawless_streak, 2);
         assert!(accl.feedback_banner.contains("GEAR 1 MASTERED"));
 
-        // Gear 2 requires 3 flawless kills
-        assert_eq!(accl.burnout_multiplier(Gear::G2), 2.8);
+        // With Gear 1 mastered, Gear 2 now has ZERO burnout (1.0x baseline tolerable drain)!
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 1.0);
         assert!(!accl.on_flawless_kill(Gear::G2, 1));
         assert!(!accl.on_flawless_kill(Gear::G2, 1));
         assert_eq!(accl.mastered_tier, 1);
@@ -2333,8 +2331,8 @@ mod tests {
     fn test_burnout_multiplier_consecutive_vs_skipped_gears() {
         let mut accl = GearAcclimatization::default();
         // At mastered_tier = 0:
-        // Consecutive tier (G1): multiplier = 1.0 + (1.0 - 0.0) * 1.8 = 2.8x
-        assert_eq!(accl.burnout_multiplier(Gear::G1), 2.8);
+        // Previous gear (Neutral) is mastered, so Gear 1 has ZERO burnout (1.0x baseline drain)!
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 1.0);
 
         // Skipped tiers: 2.5 + skipped * 2.0 + (1.0 - tol) * 2.0
         // G2 (skipped 1): 2.5 + 2.0 + 2.0 = 6.5x
@@ -2354,10 +2352,17 @@ mod tests {
         let burnout_drain = base_g6 * accl.burnout_multiplier(Gear::G6);
         assert!(burnout_drain > 1000.0, "Drain must exceed 1000/s on unmastered Gear 6!");
 
+        // Once Gear 1 is mastered, Gear 2 now has ZERO burnout (1.0x baseline drain)!
+        accl.on_flawless_kill(Gear::G1, 2);
+        assert_eq!(accl.mastered_tier, 1);
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 1.0);
+        // But Gear 3 is still skipped (mastered_tier 1 < 3 - 1 = 2, skipped = 1): 2.5 + 2.0 + 2.0 = 6.5x
+        assert_eq!(accl.burnout_multiplier(Gear::G3), 6.5);
+
         // Killing enemies while skipping tiers grants only partial familiarity (capped at 0.50)
         accl.on_flawless_kill(Gear::G6, 10);
         assert!(accl.tolerance[6] <= 0.50);
-        assert_eq!(accl.mastered_tier, 0); // Cannot skip prerequisite gears
+        assert_eq!(accl.mastered_tier, 1); // Cannot skip prerequisite gears
         assert!(accl.feedback_banner.contains("MASTER G5 FIRST"));
     }
 

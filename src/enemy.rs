@@ -5,6 +5,8 @@ pub enum EnemyType {
     Runner,
     Ninja,
     Heavy,
+    GunnerSemi,
+    GunnerAuto,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +36,8 @@ pub struct Enemy {
     pub jump_force: f32,
     pub hitbox_radius: f32,
     pub attack_damage: f32,
+    pub bullets_to_fire: u32,
+    pub fire_cooldown: f32,
 }
 
 impl Enemy {
@@ -52,6 +56,8 @@ impl Enemy {
                 jump_force: 500.0,
                 hitbox_radius: 18.0,
                 attack_damage: 15.0,
+                bullets_to_fire: 0,
+                fire_cooldown: 0.0,
             },
             EnemyType::Ninja => Self {
                 enemy_type,
@@ -66,6 +72,8 @@ impl Enemy {
                 jump_force: 620.0,
                 hitbox_radius: 16.0,
                 attack_damage: 20.0,
+                bullets_to_fire: 0,
+                fire_cooldown: 0.0,
             },
             EnemyType::Heavy => Self {
                 enemy_type,
@@ -80,6 +88,40 @@ impl Enemy {
                 jump_force: 420.0,
                 hitbox_radius: 26.0,
                 attack_damage: 35.0,
+                bullets_to_fire: 0,
+                fire_cooldown: 0.0,
+            },
+            EnemyType::GunnerSemi => Self {
+                enemy_type,
+                state: EnemyState::Chase,
+                velocity: Vec2::ZERO,
+                facing: 1.0,
+                is_grounded: true,
+                health: 1.0,
+                max_health: 1.0,
+                attack_range: 360.0,
+                speed: 160.0,
+                jump_force: 460.0,
+                hitbox_radius: 18.0,
+                attack_damage: 20.0,
+                bullets_to_fire: 0,
+                fire_cooldown: 0.0,
+            },
+            EnemyType::GunnerAuto => Self {
+                enemy_type,
+                state: EnemyState::Chase,
+                velocity: Vec2::ZERO,
+                facing: 1.0,
+                is_grounded: true,
+                health: 1.0,
+                max_health: 1.0,
+                attack_range: 280.0,
+                speed: 180.0,
+                jump_force: 480.0,
+                hitbox_radius: 18.0,
+                attack_damage: 10.0,
+                bullets_to_fire: 0,
+                fire_cooldown: 0.0,
             },
         }
     }
@@ -101,6 +143,7 @@ pub fn step_enemy_ai(
     let facing = if to_player.x >= 0.0 { 1.0 } else { -1.0 };
     let mut should_jump = false;
     let mut move_dir = 0.0;
+    let is_gunner = matches!(enemy_type, EnemyType::GunnerSemi | EnemyType::GunnerAuto);
 
     let next_state = match state {
         EnemyState::Spawning { timer } => {
@@ -112,24 +155,61 @@ pub fn step_enemy_ai(
             }
         }
         EnemyState::Chase => {
-            // Check if in attack distance
-            if dist_x <= attack_range && dist_y.abs() <= 50.0 {
-                let windup_time = match enemy_type {
-                    EnemyType::Runner => 0.45,
-                    EnemyType::Ninja => 0.28,
-                    EnemyType::Heavy => 0.70,
-                };
-                EnemyState::Windup {
-                    timer: windup_time,
-                    duration: windup_time,
+            if is_gunner {
+                // Gunners keep tactical distance: backpedal if < 140px, advance if > attack_range
+                if dist_x < 140.0 {
+                    move_dir = -facing;
+                    if is_grounded && dist_y > 45.0 && dist_x < 100.0 {
+                        should_jump = true;
+                    }
+                    EnemyState::Chase
+                } else if dist_x > attack_range {
+                    move_dir = facing;
+                    if is_grounded && dist_y > 45.0 && dist_x < 180.0 {
+                        should_jump = true;
+                    }
+                    EnemyState::Chase
+                } else {
+                    // Tactical distance sweet spot: aim when in range
+                    if dist_y.abs() <= 120.0 {
+                        let windup_time = match enemy_type {
+                            EnemyType::GunnerSemi => 0.45,
+                            EnemyType::GunnerAuto => 0.35,
+                            _ => 0.40,
+                        };
+                        EnemyState::Windup {
+                            timer: windup_time,
+                            duration: windup_time,
+                        }
+                    } else {
+                        if is_grounded && dist_y > 45.0 {
+                            should_jump = true;
+                        }
+                        move_dir = facing * 0.5;
+                        EnemyState::Chase
+                    }
                 }
             } else {
-                move_dir = facing;
-                // Jump if player is on a higher platform and we're somewhat below them
-                if is_grounded && dist_y > 45.0 && dist_x < 180.0 {
-                    should_jump = true;
+                // Melee enemies: enter Windup if in close range
+                if dist_x <= attack_range && dist_y.abs() <= 50.0 {
+                    let windup_time = match enemy_type {
+                        EnemyType::Runner => 0.45,
+                        EnemyType::Ninja => 0.28,
+                        EnemyType::Heavy => 0.70,
+                        _ => 0.45,
+                    };
+                    EnemyState::Windup {
+                        timer: windup_time,
+                        duration: windup_time,
+                    }
+                } else {
+                    move_dir = facing;
+                    // Jump if player is on a higher platform and we're somewhat below them
+                    if is_grounded && dist_y > 45.0 && dist_x < 180.0 {
+                        should_jump = true;
+                    }
+                    EnemyState::Chase
                 }
-                EnemyState::Chase
             }
         }
         EnemyState::Windup { timer, duration } => {
@@ -139,6 +219,8 @@ pub fn step_enemy_ai(
                     EnemyType::Runner => 0.25,
                     EnemyType::Ninja => 0.20,
                     EnemyType::Heavy => 0.35,
+                    EnemyType::GunnerSemi => 0.35,
+                    EnemyType::GunnerAuto => 0.45,
                 };
                 EnemyState::Attack {
                     timer: attack_time,
@@ -158,8 +240,13 @@ pub fn step_enemy_ai(
             has_hit,
         } => {
             let rem = timer - dt;
-            // Slight lunge forward during attack
-            move_dir = facing * 0.6;
+            if is_gunner {
+                // Gunners hold ground with slight recoil kickback
+                move_dir = -facing * 0.15;
+            } else {
+                // Slight lunge forward during melee attack
+                move_dir = facing * 0.6;
+            }
             if rem <= 0.0 {
                 EnemyState::Chase
             } else {
@@ -267,13 +354,21 @@ impl WaveManager {
                     let spawn_x = spawn_side * (arena_width * 0.5 - 40.0);
                     let pos = Vec2::new(spawn_x, spawn_y);
 
-                    // Choose enemy type based on wave
-                    let e_type = if self.current_wave >= 3 && *remaining_to_spawn % 4 == 0 {
-                        EnemyType::Heavy
-                    } else if self.current_wave >= 2 && *remaining_to_spawn % 3 == 0 {
-                        EnemyType::Ninja
-                    } else {
-                        EnemyType::Runner
+                    // Choose enemy type based on wave: gunners spawn in wave 2+ and wave 3+
+                    let e_type = match self.current_wave {
+                        1 => EnemyType::Runner,
+                        2 => match *remaining_to_spawn % 3 {
+                            0 => EnemyType::GunnerSemi,
+                            1 => EnemyType::Ninja,
+                            _ => EnemyType::Runner,
+                        },
+                        _ => match *remaining_to_spawn % 5 {
+                            0 => EnemyType::Heavy,
+                            1 => EnemyType::GunnerAuto,
+                            2 => EnemyType::GunnerSemi,
+                            3 => EnemyType::Ninja,
+                            _ => EnemyType::Runner,
+                        },
                     };
 
                     self.alive_count += 1;

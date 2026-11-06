@@ -88,6 +88,16 @@ pub struct WarpBeamVisual {
     pub color: Color,
 }
 
+/// Bullet projectile fired by gunner enemies.
+#[derive(Component, Debug, Clone)]
+pub struct Bullet {
+    pub velocity: Vec2,
+    pub radius: f32,
+    pub damage: f32,
+    pub lifetime: f32,
+    pub is_automatic: bool,
+}
+
 /// Combo & Score tracker
 #[derive(Resource, Debug, Clone)]
 pub struct ComboState {

@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use crate::player::Player;
 use crate::enemy::{Enemy, EnemyState, EnemyType};
 use crate::ragdoll::{RagdollPiece, RagdollPart, SliceParticle};
-use crate::combat::{SlashArcVisual, WarpBeamVisual};
+use crate::combat::{SlashArcVisual, WarpBeamVisual, Bullet};
 
 /// Joint points of a full stickman pose in world space
 #[derive(Debug, Clone)]
@@ -194,6 +194,7 @@ pub fn render_game_gizmos(
     particles_q: Query<(&Transform, &SliceParticle)>,
     slash_q: Query<&SlashArcVisual>,
     warp_q: Query<&WarpBeamVisual>,
+    bullets_q: Query<(&Transform, &Bullet)>,
     platforms_q: Query<&crate::player::Platform>,
 ) {
     let now = time.elapsed_secs();
@@ -315,15 +316,22 @@ pub fn render_game_gizmos(
             EnemyType::Runner => (Color::srgba(0.85, 0.2, 0.2, 1.0), Color::srgba(1.0, 0.3, 0.2, 1.0)),
             EnemyType::Ninja => (Color::srgba(0.5, 0.1, 0.7, 1.0), Color::srgba(0.8, 0.2, 1.0, 1.0)),
             EnemyType::Heavy => (Color::srgba(0.8, 0.35, 0.1, 1.0), Color::srgba(1.0, 0.5, 0.0, 1.0)),
+            EnemyType::GunnerSemi => (Color::srgba(0.2, 0.8, 0.45, 1.0), Color::srgba(0.3, 1.0, 0.55, 1.0)),
+            EnemyType::GunnerAuto => (Color::srgba(0.95, 0.7, 0.1, 1.0), Color::srgba(1.0, 0.85, 0.2, 1.0)),
         };
 
         // Windup telegraph line (laser warning)
         if is_windup {
             let warn_end = transform.translation.xy() + Vec2::new(enemy.facing * enemy.attack_range, 0.0);
+            let warn_color = match enemy.enemy_type {
+                EnemyType::GunnerSemi => Color::srgba(0.2, 1.0, 0.45, (now * 25.0).sin().abs()),
+                EnemyType::GunnerAuto => Color::srgba(1.0, 0.8, 0.15, (now * 30.0).sin().abs()),
+                _ => Color::srgba(1.0, 0.0, 0.0, (now * 20.0).sin().abs()),
+            };
             gizmos.line_2d(
                 transform.translation.xy() + Vec2::new(0.0, 10.0),
                 warn_end,
-                Color::srgba(1.0, 0.0, 0.0, (now * 20.0).sin().abs()),
+                warn_color,
             );
         }
 
@@ -350,7 +358,30 @@ pub fn render_game_gizmos(
         gizmos.line_2d(pose.right_knee, pose.right_foot, body_color);
 
         // Weapon
-        gizmos.line_2d(pose.sword_hilt, pose.sword_tip, weapon_color);
+        match enemy.enemy_type {
+            EnemyType::GunnerSemi => {
+                let gun_origin = pose.right_hand;
+                let barrel_dir = Vec2::new(enemy.facing, 0.0);
+                let barrel_end = gun_origin + barrel_dir * 26.0;
+                // Rifle barrel & stock
+                gizmos.line_2d(gun_origin - barrel_dir * 6.0, barrel_end, weapon_color);
+                // Scope
+                gizmos.line_2d(gun_origin + Vec2::new(0.0, 3.5), gun_origin + barrel_dir * 12.0 + Vec2::new(0.0, 3.5), weapon_color);
+            }
+            EnemyType::GunnerAuto => {
+                let gun_origin = pose.right_hand;
+                let barrel_dir = Vec2::new(enemy.facing, 0.0);
+                let barrel_end = gun_origin + barrel_dir * 18.0;
+                // Double barrel SMG
+                gizmos.line_2d(gun_origin - barrel_dir * 4.0, barrel_end, weapon_color);
+                gizmos.line_2d(gun_origin - barrel_dir * 4.0 + Vec2::new(0.0, 2.0), barrel_end + Vec2::new(0.0, 2.0), weapon_color);
+                // Drum mag
+                gizmos.circle_2d(gun_origin + barrel_dir * 4.0 + Vec2::new(0.0, -4.0), 3.0, weapon_color);
+            }
+            _ => {
+                gizmos.line_2d(pose.sword_hilt, pose.sword_tip, weapon_color);
+            }
+        }
     }
 
     // 5. Draw Ragdoll Halves
@@ -424,5 +455,27 @@ pub fn render_game_gizmos(
         gizmos.line_2d(warp.start, warp.end, glow_c);
         gizmos.line_2d(warp.start + Vec2::new(0.0, 1.5), warp.end + Vec2::new(0.0, 1.5), c);
         gizmos.line_2d(warp.start - Vec2::new(0.0, 1.5), warp.end - Vec2::new(0.0, 1.5), c);
+    }
+
+    // 9. Draw Bullets (Luminous tracer lines and glowing cores)
+    for (transform, bullet) in bullets_q.iter() {
+        let pos = transform.translation.xy();
+        let dir = bullet.velocity.normalize_or_zero();
+        let tracer_len = if bullet.is_automatic { 16.0 } else { 24.0 };
+        let tail = pos - dir * tracer_len;
+
+        let (core_color, glow_color) = if bullet.is_automatic {
+            (Color::srgba(1.0, 1.0, 0.6, 1.0), Color::srgba(1.0, 0.7, 0.1, 0.8))
+        } else {
+            (Color::srgba(0.8, 1.0, 0.9, 1.0), Color::srgba(0.2, 0.9, 0.45, 0.8))
+        };
+
+        // Outer tracer glow
+        gizmos.line_2d(tail, pos, glow_color);
+        // Inner luminous core
+        gizmos.line_2d(tail + dir * (tracer_len * 0.4), pos, core_color);
+        // Bullet head
+        gizmos.circle_2d(pos, bullet.radius, core_color);
+        gizmos.circle_2d(pos, bullet.radius + 1.5, glow_color);
     }
 }
