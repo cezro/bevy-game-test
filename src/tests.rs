@@ -456,4 +456,122 @@ mod tests {
         combo.register_kill(false); // count = 15
         assert_eq!(combo.multiplier, 5);
     }
+
+            #[test]
+    fn test_adversarial_ragdoll_piece_leak_verification() {
+        use crate::ragdoll::{update_ragdoll_physics, RagdollPiece, RagdollPart};
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<ChronoState>();
+        app.add_systems(Update, update_ragdoll_physics);
+
+        let entity = app.world_mut().spawn((
+            RagdollPiece::new(
+                RagdollPart::UpperTorso,
+                Vec2::ZERO,
+                0.0,
+                1.0,
+                Color::WHITE,
+            ),
+            Transform::from_xyz(0.0, 0.0, 0.0),
+        )).id();
+
+        // Advance 6.0 seconds (lifetime is 4.5s)
+        for _ in 0..60 {
+            {
+                let mut time = app.world_mut().resource_mut::<Time<Real>>();
+                time.advance_by(std::time::Duration::from_millis(100));
+            }
+            app.update();
+        }
+
+        // The entity MUST be despawned once expired to prevent an unbounded memory leak!
+        let exists = app.world().get_entity(entity).is_ok();
+        assert!(
+            !exists,
+            "CRITICAL FLAW: RagdollPiece entity was NOT despawned after lifetime expired! (Entity leak detected)"
+        );
+    }
+
+    #[test]
+    fn test_adversarial_duplicate_slice_events_double_decrement_alive_count() {
+        use crate::*;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<ChronoState>();
+        app.init_resource::<ComboState>();
+        app.init_resource::<WaveManager>();
+        app.add_event::<SliceEnemyEvent>();
+        app.add_systems(Update, slice_event_resolution_system);
+
+        let enemy_entity = app.world_mut().spawn((
+            Enemy::new(EnemyType::Runner),
+            Transform::from_xyz(0.0, 0.0, 0.0),
+        )).id();
+
+        // Wave manager has 1 enemy alive
+        app.world_mut().resource_mut::<WaveManager>().alive_count = 1;
+
+        // Send TWO slice events for the exact same enemy in the same frame
+        {
+            let mut events = app.world_mut().resource_mut::<Events<SliceEnemyEvent>>();
+            events.send(SliceEnemyEvent {
+                enemy_entity,
+                slice_position: Vec2::ZERO,
+                slice_direction: Vec2::X,
+                impulse: Vec2::ZERO,
+                is_warp_kill: false,
+            });
+            events.send(SliceEnemyEvent {
+                enemy_entity,
+                slice_position: Vec2::ZERO,
+                slice_direction: Vec2::X,
+                impulse: Vec2::ZERO,
+                is_warp_kill: true,
+            });
+        }
+
+        // Run system update
+        app.update();
+
+        let alive = app.world().resource::<WaveManager>().alive_count;
+        let combo_kills = app.world().resource::<ComboState>().total_kills;
+
+        assert_eq!(
+            combo_kills, 1,
+            "CRITICAL FLAW: Single enemy registered {} kills due to un-deduplicated slice events!", combo_kills
+        );
+        assert_eq!(
+            alive, 0,
+            "CRITICAL FLAW: Alive count decremented multiple times for a single entity!"
+        );
+    }
+
+    #[test]
+    fn test_adversarial_wave_phase_zero_enemies_deadlock() {
+        let mut mgr = WaveManager {
+            current_wave: 0,
+            phase: WavePhase::Spawning {
+                remaining_to_spawn: 0,
+                spawn_timer: 0.1,
+            },
+            total_wave_enemies: 0,
+            alive_count: 0,
+            spawn_interval: 1.0,
+            intermission_duration: 2.0,
+        };
+
+        // Update several times
+        for _ in 0..10 {
+            mgr.update(0.5, 1000.0, -200.0);
+        }
+
+        // If remaining_to_spawn is 0, it should transition out of Spawning!
+        match mgr.phase {
+            WavePhase::Spawning { .. } => panic!("CRITICAL FLAW: WaveManager deadlocked in Spawning phase with 0 remaining enemies!"),
+            _ => {}
+        }
+    }
 }
