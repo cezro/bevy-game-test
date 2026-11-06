@@ -1,6 +1,28 @@
 [package]
 name = "chrono_stick"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+bevy = { version = "0.15.0", default-features = false, features = [
+    "bevy_core_pipeline",
+    "bevy_render",
+    "bevy_sprite",
+    "bevy_window",
+    "bevy_winit",
+    "bevy_gizmos",
+    "bevy_ui",
+    "bevy_text",
+    "default_font",
+    "tonemapping_luts",
+    "multi_threaded",
+    "png",
+] }
+rand = "0.8"
+
+# Enable a small amount of optimization in debug mode to make Bevy run smoothly
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
