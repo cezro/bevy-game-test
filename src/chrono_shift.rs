@@ -148,6 +148,168 @@ pub fn next_gear(g: Gear, steps: i32) -> Gear {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Combat Accuracy & Acclimatization
+// ---------------------------------------------------------------------------------------------
+
+/// Event emitted during combat to notify the shifter of flawless hits, misses, or damage.
+#[derive(Event, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombatAccuracyEvent {
+    /// Slashed or warped through one or more enemies flawlessly.
+    FlawlessKill { count: u32, is_warp: bool },
+    /// Swung katana or warped without striking any enemies (miss).
+    Miss { is_warp: bool },
+    /// Player took damage from an enemy strike.
+    TookDamage,
+}
+
+/// Acclimatization and burnout state machine for the stick shift gears.
+/// Players get used to each gear through flawless kills. Skipping ahead to higher
+/// unmastered gears multiplies energy drain at an absurd rate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GearAcclimatization {
+    /// Highest consecutive gear tier that is fully mastered (0 = Neutral, 1 = G1, ..., 6 = G6).
+    pub mastered_tier: usize,
+    /// Mastery tolerance progress for each gear [N, G1, G2, G3, G4, G5, G6], normalized in 0.0..=1.0.
+    /// Neutral is always 1.0 (tolerable).
+    pub tolerance: [f32; 7],
+    /// Current flawless kill streak while operating in gear.
+    pub flawless_streak: u32,
+    /// Feedback notification banner displayed in the cockpit HUD.
+    pub feedback_banner: String,
+    /// Timer for the feedback notification banner decay.
+    pub feedback_timer: f32,
+}
+
+impl Default for GearAcclimatization {
+    fn default() -> Self {
+        let mut tol = [0.0; 7];
+        tol[0] = 1.0; // Neutral is always mastered
+        Self {
+            mastered_tier: 0,
+            tolerance: tol,
+            flawless_streak: 0,
+            feedback_banner: String::new(),
+            feedback_timer: 0.0,
+        }
+    }
+}
+
+impl GearAcclimatization {
+    /// Number of flawless kills required to master each gear tier.
+    pub fn required_kills(gear_idx: usize) -> u32 {
+        match gear_idx {
+            1 => 2, // G1: 2 flawless kills
+            2 => 3, // G2: 3 flawless kills
+            3 => 3, // G3: 3 flawless kills
+            4 => 4, // G4: 4 flawless kills
+            5 => 4, // G5: 4 flawless kills
+            6 => 5, // G6: 5 flawless kills (Stasis)
+            _ => 1,
+        }
+    }
+
+    /// Ticks down UI feedback banner timers.
+    pub fn tick(&mut self, dt: f32) {
+        if self.feedback_timer > 0.0 {
+            self.feedback_timer = (self.feedback_timer - dt).max(0.0);
+            if self.feedback_timer <= 0.0 {
+                self.feedback_banner.clear();
+            }
+        }
+    }
+
+    /// Registers a flawless strike/kill. Returns true if a new gear tier was mastered.
+    pub fn on_flawless_kill(&mut self, active_gear: Gear, count: u32) -> bool {
+        let idx = active_gear.index();
+        if idx == 0 || count == 0 {
+            return false;
+        }
+        self.flawless_streak += count;
+
+        let req = Self::required_kills(idx) as f32;
+        let add = (count as f32) / req;
+        let mut newly_mastered = false;
+
+        if self.mastered_tier >= idx - 1 {
+            let prev = self.tolerance[idx];
+            self.tolerance[idx] = (self.tolerance[idx] + add).min(1.0);
+            if self.tolerance[idx] >= 0.999 && prev < 0.999 {
+                newly_mastered = true;
+                while self.mastered_tier < 6 && self.tolerance[self.mastered_tier + 1] >= 0.999 {
+                    self.mastered_tier += 1;
+                }
+                self.feedback_banner = format!("GEAR {} MASTERED! ✨", idx);
+                self.feedback_timer = 2.2;
+            } else if !newly_mastered {
+                self.feedback_banner = format!("FLAWLESS! [G{}: {:.0}%]", idx, self.tolerance[idx] * 100.0);
+                self.feedback_timer = 1.2;
+            }
+        } else {
+            // Skipped ahead without mastering previous gears:
+            // Can only gain partial familiarity capped at 0.50 until prerequisites are met
+            self.tolerance[idx] = (self.tolerance[idx] + add * 0.4).min(0.5);
+            self.feedback_banner = format!("FLAWLESS (MASTER G{} FIRST)", idx - 1);
+            self.feedback_timer = 1.2;
+        }
+
+        newly_mastered
+    }
+
+    /// Registers a missed attack (empty air). Breaks streak and penalizes unmastered tolerance.
+    pub fn on_miss(&mut self, active_gear: Gear, is_warp: bool) {
+        let idx = active_gear.index();
+        self.flawless_streak = 0;
+        if idx > 0 && self.tolerance[idx] < 0.999 {
+            let penalty = if is_warp { 0.40 } else { 0.30 };
+            self.tolerance[idx] = (self.tolerance[idx] - penalty).max(0.0);
+            self.feedback_banner = if is_warp {
+                "⚠️ WARP MISSED - FOCUS LOST!".to_string()
+            } else {
+                "⚠️ SLASH MISSED - FOCUS LOST!".to_string()
+            };
+            self.feedback_timer = 1.2;
+        }
+    }
+
+    /// Registers player taking damage. Breaks cadence and applies a slight composure penalty.
+    pub fn on_damage(&mut self, active_gear: Gear) {
+        self.flawless_streak = 0;
+        let idx = active_gear.index();
+        if idx > 0 && self.tolerance[idx] < 0.999 {
+            self.tolerance[idx] = (self.tolerance[idx] - 0.20).max(0.0);
+            self.feedback_banner = "⚠️ HIT TAKEN - CADENCE BROKEN!".to_string();
+            self.feedback_timer = 1.2;
+        }
+    }
+
+    /// Burnout energy drain multiplier for the active gear.
+    /// If mastered: 1.0 (baseline tolerable drain).
+    /// If in next tier: 1.0..=2.8x (mild adaptation drain).
+    /// If skipped ahead: 2.5x..=14.5x (absurd burnout drain rate!).
+    pub fn burnout_multiplier(&self, active_gear: Gear) -> f32 {
+        let idx = active_gear.index();
+        if idx == 0 {
+            return 1.0;
+        }
+        let tol = self.tolerance[idx];
+        if self.mastered_tier >= idx && tol >= 0.999 {
+            1.0
+        } else if self.mastered_tier == idx - 1 {
+            1.0 + (1.0 - tol) * 1.8
+        } else {
+            let skipped = (idx - 1 - self.mastered_tier) as f32;
+            2.5 + skipped * 2.0 + (1.0 - tol) * 2.0
+        }
+    }
+
+    /// Returns true if the gear is fully mastered (tolerable without burnout).
+    pub fn is_mastered(&self, gear: Gear) -> bool {
+        let idx = gear.index();
+        idx == 0 || (self.mastered_tier >= idx && self.tolerance[idx] >= 0.999)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Pure gate kinematics
 // ---------------------------------------------------------------------------------------------
 
@@ -486,9 +648,9 @@ impl ShifterModel {
         // 2. Intent.
         self.held = input.held;
         let mut dragged = false;
-        if !self.held || self.stalled {
+        if self.stalled {
             self.ensure_heading_neutral();
-        } else {
+        } else if self.held {
             let drag = Vec2::new(finite_or(input.drag.x, 0.0), finite_or(input.drag.y, 0.0));
             if drag.length() > DRAG_DEADZONE {
                 self.path.clear();
@@ -509,6 +671,8 @@ impl ShifterModel {
                 self.set_target(next_gear(base, input.wheel_steps));
             }
         }
+        // When !self.held and !self.stalled, do NOT force neutral!
+        // The stick remains in whichever gear it was placed in until explicitly returned to neutral.
 
         // 3. Integrate.
         if !self.path.is_empty() {
@@ -516,7 +680,7 @@ impl ShifterModel {
             if self.path.is_empty() {
                 self.target = None;
             }
-        } else if self.held && !dragged {
+        } else if !dragged {
             self.knob = detent_step(self.knob, dt);
         }
         self.knob = project_legal(self.knob);
@@ -532,7 +696,13 @@ impl ShifterModel {
         }
 
         // 5. Timers.
-        let fade_target = if self.held { 1.0 } else { 0.0 };
+        let fade_target = if self.held {
+            1.0
+        } else if self.stalled || self.knob == Vec2::ZERO {
+            0.0
+        } else {
+            0.65 // persistent in-gear display while cruising in slowmo
+        };
         let fade_step = dt / FADE_TIME;
         self.fade = if self.fade < fade_target {
             (self.fade + fade_step).min(fade_target)
@@ -566,7 +736,10 @@ pub fn meter_drain(dilation: f32) -> f32 {
 #[derive(Resource, Debug, Clone)]
 pub struct ChronoShifter {
     pub model: ShifterModel,
+    pub acclimatization: GearAcclimatization,
+    pub base_drain_per_sec: f32,
     pub drain_per_sec: f32,
+    pub burnout_multiplier: f32,
     pub energy_frac: f32,
     /// Screen-space cursor anchor captured on press.
     pub anchor_screen: Option<Vec2>,
@@ -581,7 +754,10 @@ impl Default for ChronoShifter {
     fn default() -> Self {
         Self {
             model: ShifterModel::default(),
+            acclimatization: GearAcclimatization::default(),
+            base_drain_per_sec: 0.0,
             drain_per_sec: 0.0,
+            burnout_multiplier: 1.0,
             energy_frac: 1.0,
             anchor_screen: None,
             frozen_aim: None,
@@ -633,6 +809,7 @@ pub fn chrono_shift_control_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut motion: EventReader<MouseMotion>,
     mut wheel: EventReader<MouseWheel>,
+    mut accuracy_events: EventReader<CombatAccuracyEvent>,
     mut shifter: ResMut<ChronoShifter>,
     mut chrono: ResMut<ChronoState>,
     mut energy_q: Query<&mut ChronoEnergy, With<Player>>,
@@ -674,7 +851,31 @@ pub fn chrono_shift_control_system(
 
     let out = shifter.model.step(&input, energy_frac, dt);
     let dilation = out.dilation;
-    let drain = meter_drain(dilation);
+    let active_gear = display_gear(shifter.model.knob);
+
+    // Process combat accuracy feedback (flawless kills, misses, damage)
+    for ev in accuracy_events.read() {
+        match *ev {
+            CombatAccuracyEvent::FlawlessKill { count, .. } => {
+                shifter.acclimatization.on_flawless_kill(active_gear, count);
+            }
+            CombatAccuracyEvent::Miss { is_warp } => {
+                shifter.acclimatization.on_miss(active_gear, is_warp);
+            }
+            CombatAccuracyEvent::TookDamage => {
+                shifter.acclimatization.on_damage(active_gear);
+            }
+        }
+    }
+    shifter.acclimatization.tick(dt);
+
+    let base_drain = meter_drain(dilation);
+    let burnout_mult = if dilation < DILATING_THRESHOLD {
+        shifter.acclimatization.burnout_multiplier(active_gear)
+    } else {
+        1.0
+    };
+    let drain = base_drain * burnout_mult;
 
     if let Some(e) = energy.as_deref_mut() {
         e.update_with_drain(drain, dt);
@@ -682,6 +883,8 @@ pub fn chrono_shift_control_system(
     } else {
         shifter.energy_frac = 1.0;
     }
+    shifter.base_drain_per_sec = base_drain;
+    shifter.burnout_multiplier = burnout_mult;
     shifter.drain_per_sec = drain;
 
     let was = chrono.is_dilating;
@@ -739,6 +942,7 @@ impl Plugin for ChronoShiftCorePlugin {
         app.init_resource::<ChronoShifter>()
             .add_event::<MouseMotion>()
             .add_event::<MouseWheel>()
+            .add_event::<CombatAccuracyEvent>()
             .add_systems(
                 Update,
                 (chrono_shift_control_system, chrono_shift_cursor_pin_system)
@@ -817,16 +1021,50 @@ fn setup_chrono_shift_ui(mut commands: Commands) {
 }
 
 /// Readout text formatting (pure, shared with tests).
-pub fn readout_text(model: &ShifterModel, drain: f32, energy_frac: f32) -> String {
+pub fn readout_text(
+    model: &ShifterModel,
+    drain: f32,
+    energy_frac: f32,
+    acclimatization: &GearAcclimatization,
+) -> String {
     if model.stalled {
         format!("STALL  ·  GRIND  ·  RECHARGE {:.0}%", (energy_frac * 100.0).clamp(0.0, 100.0))
     } else {
-        format!(
-            "GEAR {}  ·  {:.2}x  ·  DRAIN {:.0}/s",
-            display_gear(model.knob).label(),
-            model.dilation,
-            drain
-        )
+        let active = display_gear(model.knob);
+        let g_idx = active.index();
+        if g_idx == 0 {
+            format!("GEAR N  ·  1.00x  ·  DRAIN 0/s")
+        } else {
+            let burnout_mult = acclimatization.burnout_multiplier(active);
+            let status = if !acclimatization.feedback_banner.is_empty() {
+                acclimatization.feedback_banner.as_str()
+            } else if acclimatization.is_mastered(active) {
+                "MASTERED ✨"
+            } else if burnout_mult > 1.05 && g_idx > acclimatization.mastered_tier + 1 {
+                "⚠️ BURNOUT!"
+            } else {
+                "ADAPTING..."
+            };
+
+            if burnout_mult > 1.05 {
+                format!(
+                    "GEAR {}  ·  {:.2}x  ·  [{}]  ·  ⚠️ BURNOUT x{:.1}  ·  DRAIN {:.0}/s",
+                    active.label(),
+                    model.dilation,
+                    status,
+                    burnout_mult,
+                    drain
+                )
+            } else {
+                format!(
+                    "GEAR {}  ·  {:.2}x  ·  [{}]  ·  DRAIN {:.0}/s",
+                    active.label(),
+                    model.dilation,
+                    status,
+                    drain
+                )
+            }
+        }
     }
 }
 
@@ -838,13 +1076,21 @@ fn chrono_shift_ui_system(
 ) {
     let m = &shifter.model;
     for (mut text, mut color) in readout_q.iter_mut() {
-        let s = readout_text(m, shifter.drain_per_sec, shifter.energy_frac);
+        let s = readout_text(m, shifter.drain_per_sec, shifter.energy_frac, &shifter.acclimatization);
         if **text != s {
             **text = s;
         }
         let a = m.fade.clamp(0.0, 1.0);
+        let active = display_gear(m.knob);
+        let is_burnout = shifter.burnout_multiplier > 1.05;
+        let is_mastered = shifter.acclimatization.is_mastered(active) && active != Gear::N;
+
         *color = if m.stalled || m.stall_flash > 0.0 {
             TextColor(Color::srgba(1.0, 0.25, 0.2, a.max(m.stall_flash)))
+        } else if is_burnout {
+            TextColor(Color::srgba(1.0, 0.35, 0.15, a))
+        } else if is_mastered {
+            TextColor(Color::srgba(0.25, 1.0, 0.75, a))
         } else {
             TextColor(Color::srgba(1.0, 0.78, 0.35, a))
         };
@@ -990,21 +1236,34 @@ fn chrono_shift_gizmo_system(
 
     // Labels.
     let active = display_gear(m.knob);
+    let is_burnout = shifter.burnout_multiplier > 1.05;
     for g in &Gear::ALL[1..] {
         let p = g.pos();
         let lp = Vec2::new(p.x, p.y.signum() * (1.0 + CHANNEL_HALF + 0.38));
-        let col = if *g == active { cyan } else { brass };
+        let col = if *g == active {
+            if is_burnout { red } else { cyan }
+        } else if shifter.acclimatization.is_mastered(*g) {
+            Color::srgba(0.25, 0.95, 0.65, 1.0)
+        } else {
+            brass
+        };
         draw_glyph(&mut gizmos, g.label().chars().next().unwrap_or(' '), to_w(lp), 0.34 * GATE_SCALE, with_alpha(col, a));
     }
     let n_col = if active == Gear::N { cyan } else { brass_dim };
     draw_glyph(&mut gizmos, 'N', to_w(Vec2::new(-1.0 - CHANNEL_HALF - 0.38, 0.0)), 0.30 * GATE_SCALE, with_alpha(n_col, a));
     gizmos.circle_2d(to_w(Vec2::ZERO), 2.0, with_alpha(brass_dim, a));
 
-    // Knob position with seat micro shake.
+    // Knob position with seat micro shake and burnout vibration.
     let t = time.elapsed_secs();
     let kick = (m.seat_kick / SEAT_KICK_TIME).clamp(0.0, 1.0);
+    let burnout_jitter = if is_burnout {
+        Vec2::new((t * 79.0).sin(), (t * 103.0).cos()) * 3.5 * (shifter.burnout_multiplier - 1.0).min(3.0)
+    } else {
+        Vec2::ZERO
+    };
     let jitter = Vec2::new((t * 97.0).sin(), (t * 131.0).cos()) * 2.0 * kick
-        + Vec2::new((t * 61.0).sin(), 0.0) * 3.0 * grind;
+        + Vec2::new((t * 61.0).sin(), 0.0) * 3.0 * grind
+        + burnout_jitter;
     let knob_w = to_w(m.knob) + jitter;
 
     // Stick: shaft from a pivot below the gate, with key-bit teeth at the base.
@@ -1022,7 +1281,15 @@ fn chrono_shift_gizmo_system(
     }
 
     // Cog knob.
-    let engaged_col = if m.stalled { red } else { brass.mix(&cyan, e) };
+    let engaged_col = if m.stalled {
+        red
+    } else if is_burnout {
+        Color::srgba(1.0, 0.28, 0.12, 1.0)
+    } else if shifter.acclimatization.is_mastered(active) && active != Gear::N {
+        Color::srgba(0.25, 0.95, 0.65, 1.0)
+    } else {
+        brass.mix(&cyan, e)
+    };
     let col = with_alpha(engaged_col, a);
     let r_in = 0.20 * GATE_SCALE;
     let r_out = 0.29 * GATE_SCALE;
@@ -1278,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn release_springs_back_to_neutral_and_fades() {
+    fn test_gear_persists_on_release_and_manual_neutral_return() {
         let mut m = ShifterModel::default();
         m.step(&ShifterInput { held: true, jump_to: Some(Gear::G6), ..default() }, 1.0, 0.016);
         for _ in 0..60 {
@@ -1287,13 +1554,29 @@ mod tests {
         assert_eq!(m.knob, Gear::G6.pos());
         assert!((m.dilation - 0.04).abs() < 1e-6);
         assert!((m.fade - 1.0).abs() < 1e-6);
+
+        // When releasing Shift: knob stays in Gear 6!
         for _ in 0..60 {
             let out = m.step(&ShifterInput::default(), 1.0, 0.016);
             assert!(is_legal(m.knob));
-            assert!((0.04..=1.0).contains(&out.dilation));
+            assert_eq!(m.knob, Gear::G6.pos(), "Gear must stay engaged on Shift release");
+            assert!((out.dilation - 0.04).abs() < 1e-6, "Time dilation remains active while cruising");
+        }
+        assert!((m.fade - 0.65).abs() < 0.01, "HUD stays persistently visible in gear");
+
+        // To return to Neutral: player holds Shift and selects Neutral (0 / `)
+        m.step(&ShifterInput { held: true, jump_to: Some(Gear::N), ..default() }, 1.0, 0.016);
+        for _ in 0..60 {
+            m.step(&ShifterInput { held: true, ..default() }, 1.0, 0.016);
         }
         assert_eq!(m.knob, Vec2::ZERO);
         assert_eq!(m.dilation, 1.0);
+
+        // Once in neutral and shift is released: it cleanly fades away
+        for _ in 0..60 {
+            m.step(&ShifterInput::default(), 1.0, 0.016);
+        }
+        assert_eq!(m.knob, Vec2::ZERO);
         assert_eq!(m.fade, 0.0);
     }
 
@@ -1370,9 +1653,17 @@ mod tests {
     #[test]
     fn readout_format() {
         let mut m = ShifterModel { knob: Gear::G4.pos(), dilation: 0.24, ..default() };
-        assert_eq!(readout_text(&m, drain_for_dilation(0.24), 1.0), "GEAR 4  ·  0.24x  ·  DRAIN 43/s");
+        let mut accl = GearAcclimatization::default();
+        accl.mastered_tier = 4;
+        accl.tolerance[4] = 1.0;
+        assert_eq!(readout_text(&m, drain_for_dilation(0.24), 1.0, &accl), "GEAR 4  ·  0.24x  ·  [MASTERED ✨]  ·  DRAIN 43/s");
+
+        let unmastered = GearAcclimatization::default();
+        let burnout_str = readout_text(&m, drain_for_dilation(0.24) * 10.5, 1.0, &unmastered);
+        assert!(burnout_str.contains("⚠️ BURNOUT"));
+
         m.stalled = true;
-        assert!(readout_text(&m, 0.0, 0.1).starts_with("STALL"));
+        assert!(readout_text(&m, 0.0, 0.1, &accl).starts_with("STALL"));
     }
 
     #[test]
@@ -1399,6 +1690,14 @@ mod tests {
             .add_plugins(ChronoShiftCorePlugin)
             .add_systems(Update, update_chrono_system);
         app.world_mut().spawn((Player::default(), ChronoEnergy::default(), Transform::default()));
+        // Fully master gears by default in kinematic harness to test pure mechanical shifting
+        {
+            let mut shifter = app.world_mut().resource_mut::<ChronoShifter>();
+            shifter.acclimatization.mastered_tier = 6;
+            for t in &mut shifter.acclimatization.tolerance {
+                *t = 1.0;
+            }
+        }
         app.update(); // prime time
         app
     }
@@ -1468,16 +1767,35 @@ mod tests {
         run(&mut app, 30);
         assert!((app.world().resource::<ChronoState>().slowmo_factor - 0.12).abs() < 1e-4);
 
-        // Release -> neutral, time recovers.
+        // Replenish energy so cruising doesn't immediately stall
+        set_energy(&mut app, 100.0);
+
+        // Release shift -> stick STAYS in gear, HUD drops to cruising opacity, dilation persists!
         key(&mut app, KeyCode::ShiftLeft, false);
         run(&mut app, 60);
-        let chrono = app.world().resource::<ChronoState>();
-        assert_eq!(chrono.slowmo_factor, 1.0);
-        assert!(!chrono.is_dilating);
-        assert!((chrono.dilation_factor - 1.0).abs() < 0.01);
-        let s = app.world().resource::<ChronoShifter>();
-        assert!(!s.aim_frozen());
-        assert_eq!(s.model.knob, Vec2::ZERO);
+        {
+            let chrono = app.world().resource::<ChronoState>();
+            assert!((chrono.slowmo_factor - 0.12).abs() < 1e-4);
+            assert!(chrono.is_dilating);
+            let s = app.world().resource::<ChronoShifter>();
+            assert!(!s.is_held());
+            assert_eq!(s.model.knob, Gear::G5.pos());
+        }
+
+        // Return to neutral by holding Shift and pressing Digit0
+        key(&mut app, KeyCode::ShiftLeft, true);
+        key(&mut app, KeyCode::Digit0, true);
+        app.update();
+        key(&mut app, KeyCode::Digit0, false);
+        run(&mut app, 60);
+        {
+            let chrono = app.world().resource::<ChronoState>();
+            assert_eq!(chrono.slowmo_factor, 1.0);
+            assert!(!chrono.is_dilating);
+            assert!((chrono.dilation_factor - 1.0).abs() < 0.01);
+            let s = app.world().resource::<ChronoShifter>();
+            assert_eq!(s.model.knob, Vec2::ZERO);
+        }
     }
 
     #[test]
@@ -1596,7 +1914,8 @@ mod tests {
         let mut corrupted_model = ShifterModel::default();
         corrupted_model.knob = Vec2::new(neg_zero, neg_zero);
         corrupted_model.dilation = f32::NAN;
-        let txt = readout_text(&corrupted_model, f32::NAN, f32::NAN);
+        let accl = GearAcclimatization::default();
+        let txt = readout_text(&corrupted_model, f32::NAN, f32::NAN, &accl);
         assert!(!txt.is_empty());
     }
 
@@ -1805,12 +2124,29 @@ mod tests {
             assert!(is_legal(shifter.model.knob));
         }
 
-        // Release shift
+        // Replenish energy so cruising doesn't stall
+        set_energy(&mut app, 100.0);
+
+        // Release shift: stick remains in gear
         key(&mut app, KeyCode::ShiftLeft, false);
         run(&mut app, 40);
-        let shifter = app.world().resource::<ChronoShifter>();
-        assert_eq!(shifter.model.knob, Vec2::ZERO);
-        assert_eq!(shifter.model.dilation, 1.0);
+        {
+            let shifter = app.world().resource::<ChronoShifter>();
+            assert!(!shifter.is_held());
+            assert_eq!(shifter.model.knob, Gear::G6.pos());
+        }
+
+        // Return to neutral via Shift + Digit0
+        key(&mut app, KeyCode::ShiftLeft, true);
+        key(&mut app, KeyCode::Digit0, true);
+        app.update();
+        key(&mut app, KeyCode::Digit0, false);
+        run(&mut app, 40);
+        {
+            let shifter = app.world().resource::<ChronoShifter>();
+            assert_eq!(shifter.model.knob, Vec2::ZERO);
+            assert_eq!(shifter.model.dilation, 1.0);
+        }
     }
 
     #[test]
@@ -1848,5 +2184,118 @@ mod tests {
         key(&mut app, KeyCode::KeyQ, false);
         let e = energy(&mut app);
         assert!(e < 20.0);
+    }
+
+    #[test]
+    fn test_gear_acclimatization_flawless_progression_and_mastery() {
+        let mut accl = GearAcclimatization::default();
+        assert_eq!(accl.mastered_tier, 0);
+        assert!(!accl.is_mastered(Gear::G1));
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 2.8);
+
+        // Gear 1 requires 2 flawless kills to master
+        assert!(!accl.on_flawless_kill(Gear::G1, 1));
+        assert_eq!(accl.mastered_tier, 0);
+        assert!((accl.tolerance[1] - 0.5).abs() < 1e-4);
+        assert_eq!(accl.flawless_streak, 1);
+        assert!((accl.burnout_multiplier(Gear::G1) - 1.9).abs() < 1e-4);
+
+        // 2nd flawless kill completes Gear 1 mastery
+        assert!(accl.on_flawless_kill(Gear::G1, 1));
+        assert_eq!(accl.mastered_tier, 1);
+        assert!(accl.is_mastered(Gear::G1));
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 1.0);
+        assert_eq!(accl.flawless_streak, 2);
+        assert!(accl.feedback_banner.contains("GEAR 1 MASTERED"));
+
+        // Gear 2 requires 3 flawless kills
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 2.8);
+        assert!(!accl.on_flawless_kill(Gear::G2, 1));
+        assert!(!accl.on_flawless_kill(Gear::G2, 1));
+        assert_eq!(accl.mastered_tier, 1);
+        assert!(accl.on_flawless_kill(Gear::G2, 1));
+        assert_eq!(accl.mastered_tier, 2);
+        assert!(accl.is_mastered(Gear::G2));
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 1.0);
+    }
+
+    #[test]
+    fn test_gear_acclimatization_miss_penalty_and_streak_reset() {
+        let mut accl = GearAcclimatization::default();
+        // Master Gear 1 first
+        accl.on_flawless_kill(Gear::G1, 2);
+        assert_eq!(accl.mastered_tier, 1);
+
+        // Start practicing Gear 2 (requires 3 kills, 1 kill gives ~0.333)
+        accl.on_flawless_kill(Gear::G2, 1);
+        assert_eq!(accl.flawless_streak, 3);
+        let tol_before = accl.tolerance[2];
+        assert!((tol_before - 0.333).abs() < 0.01);
+
+        // Slash miss: breaks streak, penalizes tolerance by 0.30
+        accl.on_miss(Gear::G2, false);
+        assert_eq!(accl.flawless_streak, 0);
+        assert!(accl.tolerance[2] < tol_before);
+        assert!(accl.feedback_banner.contains("SLASH MISSED"));
+
+        // Repeated misses clamp at 0.0, never negative
+        accl.on_miss(Gear::G2, false);
+        assert_eq!(accl.tolerance[2], 0.0);
+
+        // Rebuild tolerance with 2 kills
+        accl.on_flawless_kill(Gear::G2, 2);
+        assert!((accl.tolerance[2] - 0.666).abs() < 0.01);
+
+        // Warp miss: breaks streak, penalizes by 0.40
+        accl.on_miss(Gear::G2, true);
+        assert_eq!(accl.flawless_streak, 0);
+        assert!((accl.tolerance[2] - 0.266).abs() < 0.01);
+        assert!(accl.feedback_banner.contains("WARP MISSED"));
+
+        // Hit taken (damage): breaks streak, penalizes by 0.20
+        accl.on_damage(Gear::G2);
+        assert_eq!(accl.flawless_streak, 0);
+        assert!((accl.tolerance[2] - 0.066).abs() < 0.01);
+        assert!(accl.feedback_banner.contains("HIT TAKEN"));
+
+        // Mastered gears are immune to miss penalties
+        let g1_before = accl.tolerance[1];
+        accl.on_miss(Gear::G1, false);
+        accl.on_miss(Gear::G1, true);
+        accl.on_damage(Gear::G1);
+        assert_eq!(accl.tolerance[1], g1_before);
+        assert!(accl.is_mastered(Gear::G1));
+    }
+
+    #[test]
+    fn test_burnout_multiplier_consecutive_vs_skipped_gears() {
+        let mut accl = GearAcclimatization::default();
+        // At mastered_tier = 0:
+        // Consecutive tier (G1): multiplier = 1.0 + (1.0 - 0.0) * 1.8 = 2.8x
+        assert_eq!(accl.burnout_multiplier(Gear::G1), 2.8);
+
+        // Skipped tiers: 2.5 + skipped * 2.0 + (1.0 - tol) * 2.0
+        // G2 (skipped 1): 2.5 + 2.0 + 2.0 = 6.5x
+        assert_eq!(accl.burnout_multiplier(Gear::G2), 6.5);
+        // G3 (skipped 2): 2.5 + 4.0 + 2.0 = 8.5x
+        assert_eq!(accl.burnout_multiplier(Gear::G3), 8.5);
+        // G4 (skipped 3): 2.5 + 6.0 + 2.0 = 10.5x
+        assert_eq!(accl.burnout_multiplier(Gear::G4), 10.5);
+        // G5 (skipped 4): 2.5 + 8.0 + 2.0 = 12.5x
+        assert_eq!(accl.burnout_multiplier(Gear::G5), 12.5);
+        // G6 (skipped 5): 2.5 + 10.0 + 2.0 = 14.5x (Absurd burnout!)
+        assert_eq!(accl.burnout_multiplier(Gear::G6), 14.5);
+
+        // In Gear 6, base drain is 69.1/s.
+        // With 14.5x burnout multiplier, total drain is 1002/s!
+        let base_g6 = drain_for_dilation(0.04);
+        let burnout_drain = base_g6 * accl.burnout_multiplier(Gear::G6);
+        assert!(burnout_drain > 1000.0, "Drain must exceed 1000/s on unmastered Gear 6!");
+
+        // Killing enemies while skipping tiers grants only partial familiarity (capped at 0.50)
+        accl.on_flawless_kill(Gear::G6, 10);
+        assert!(accl.tolerance[6] <= 0.50);
+        assert_eq!(accl.mastered_tier, 0); // Cannot skip prerequisite gears
+        assert!(accl.feedback_banner.contains("MASTER G5 FIRST"));
     }
 }

@@ -37,8 +37,8 @@ Holding **Shift** raises an intricate brass and mechanical gearwork H-gate in th
 
 - **Machined Physical Gate**: The knob is strictly constrained to the gate channels; wall collisions and sub-stepped physics prevent tunneling.
 - **Detents & Seating**: Releasing mouse drag smoothly snaps the knob into the nearest detent with mechanical micro-shake and haptic visual feedback.
-- **Spring Return on Release**: Releasing the Shift key automatically returns the knob to Neutral along legal gate channels and fades out the interface.
-- **Cursor Anchoring**: While shifting, the combat aim vector is frozen at its initial anchor so cursor manipulation does not disturb combat targeting.
+- **In-Gear Persistence on Release**: Once engaged in a gear, releasing the Shift key **leaves the stick in that gear**. The cockpit HUD remains visible at cruising opacity (65%), sustaining time dilation while freeing your mouse and controls for active combat! Returning to Neutral requires holding Shift and pressing `0` or `` ` ``, or stalling at 0 energy.
+- **Cursor Anchoring**: While shifting with Shift held, the combat aim vector is frozen at its initial anchor so cursor manipulation within the cockpit does not disturb combat targeting.
 
 ### 2. Gear & Time Dilation Ratio Table
 
@@ -60,6 +60,25 @@ Holding **Shift** raises an intricate brass and mechanical gearwork H-gate in th
   - If the Chrono Meter is completely drained to 0% while dilating, the gearbox **stalls** with a red warning flash and grinding camera tremor.
   - The knob is immediately forced back to Neutral (1.0x speed).
   - Shifting is locked out until the player recharges to at least **20% energy** (via kills or passive regen).
+
+### 4. Gear Acclimatization, Flawless Kills & Burnout Mechanics
+- **Cadence & Familiarity**: The stickman's nervous system must adapt to higher speeds. The player becomes accustomed to higher gears by executing flawless kills without whiffing attacks or taking damage.
+- **Flawless Mastery Requirements**:
+  - **Gear 1**: 2 flawless kills to master.
+  - **Gear 2 & 3**: 3 flawless kills to master.
+  - **Gear 4 & 5**: 4 flawless kills to master.
+  - **Gear 6 (Stasis)**: 5 flawless kills to master.
+  - Mastered gears illuminate in glowing emerald/gold with `[MASTERED ✨]` in the HUD, locking in the baseline tolerable drain rate ($\times 1.0$).
+- **Absurd Burnout Drain on Skipped Tiers**:
+  - Shifting into higher gears without mastering previous tiers triggers a massive **burnout multiplier**:
+    $$\text{Burnout Multiplier} = 2.5 + (\text{Skipped Tiers} \times 2.0) + (1.0 - \text{Tolerance}) \times 2.0$$
+  - Skipping directly to Gear 6 at tier 0 imposes an absurd **$14.5\times$ drain penalty** ($>1,000 \text{ energy/sec}$), vaporizing the entire 100-energy meter in under 100 milliseconds and instantly stalling the gearbox!
+  - Flawless kills while skipping ahead only yield partial familiarity ($\le 50\%$) until earlier gears are mastered.
+- **Miss Penalties & Composure Loss**:
+  - Whiffing a Katana Slash resets your flawless streak and penalizes unmastered gear tolerance by **-30%** (`⚠️ SLASH MISSED - FOCUS LOST!`).
+  - Whiffing a Chrono Warp resets your streak and penalizes unmastered gear tolerance by **-40%** (`⚠️ WARP MISSED - FOCUS LOST!`).
+  - Taking enemy damage resets your streak and penalizes tolerance by **-20%** (`⚠️ HIT TAKEN - CADENCE BROKEN!`).
+  - Mastered gears are permanently locked and cannot be degraded by misses.
 
 ---
 
@@ -96,6 +115,6 @@ Run the full suite of unit, kinematic, fuzzing, and adversarial stress tests:
 cargo test
 ```
 
-All 41 tests pass cleanly:
-- 24 Core Gameplay tests (kinematics, jump curves, coyote time, katana hitboxes, ragdoll physics, wave escalation, anti-deadlock).
-- 17 Chronos Shift tests (fuzzing gate boundaries, wall collision, sequential wheel shifts, planned path finding, quadratic drain math, stall hysteresis, and full Bevy App ECS integration).
+All 50 tests pass cleanly:
+- 24 Core Gameplay tests (kinematics, jump curves, coyote time, katana hitboxes, ragdoll physics, wave escalation, anti-deadlock, ragdoll entity lifecycle).
+- 26 Chronos Shift & Acclimatization tests (fuzzing gate boundaries, wall collisions, anti-tunneling, gear persistence on release, sequential wheel shifts, planned path finding, quadratic drain math, gear acclimatization progression via flawless kills, miss penalties and streak resets, consecutive vs skipped tier burnout multipliers, stall hysteresis, and full Bevy App ECS integration).

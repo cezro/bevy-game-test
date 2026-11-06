@@ -585,6 +585,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         app.init_resource::<ChronoState>();
+        app.add_event::<CombatAccuracyEvent>();
         app.add_systems(PreUpdate, |mut time: ResMut<Time<Real>>| {
             time.advance_by(std::time::Duration::from_millis(50));
         });

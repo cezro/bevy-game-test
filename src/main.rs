@@ -19,7 +19,7 @@ use enemy::{Enemy, EnemyState, EnemyType, WaveManager, WaveAction, step_enemy_ai
 use ragdoll::{RagdollPiece, RagdollPart, SliceParticle, calculate_slice_split_velocities, update_ragdoll_physics};
 use render::{render_game_gizmos, GhostTrail, generate_stickman_pose};
 use ui::{setup_ui, update_ui_system};
-use chrono_shift::{ChronoShiftPlugin, ChronoShifter};
+use chrono_shift::{ChronoShiftPlugin, ChronoShifter, CombatAccuracyEvent};
 
 #[derive(Resource, Default)]
 pub struct CursorWorldCoords(pub Option<Vec2>);
@@ -337,6 +337,7 @@ pub fn player_katana_slash_system(
     enemies_q: Query<(Entity, &Transform, &Enemy), Without<Player>>,
     audio: Option<Res<GameAudioAssets>>,
     mut slice_events: EventWriter<SliceEnemyEvent>,
+    mut accuracy_events: EventWriter<CombatAccuracyEvent>,
     mut commands: Commands,
 ) {
     let Ok((p_transform, mut player)) = player_q.get_single_mut() else {
@@ -376,9 +377,11 @@ pub fn player_katana_slash_system(
         });
 
         // Check enemies hit by katana slash
+        let mut hit_count = 0;
         for (e_entity, e_transform, enemy) in enemies_q.iter() {
             let enemy_center = e_transform.translation.xy() + Vec2::new(0.0, 16.0);
             if katana_arc_intersects(origin, player.facing, aim_dir, enemy_center, slash_range, arc_span, enemy.hitbox_radius) {
+                hit_count += 1;
                 let slice_dir = aim_dir;
                 let impulse = aim_dir * 320.0 + Vec2::new(0.0, 180.0);
                 slice_events.send(SliceEnemyEvent {
@@ -389,6 +392,12 @@ pub fn player_katana_slash_system(
                     is_warp_kill: false,
                 });
             }
+        }
+
+        if hit_count > 0 {
+            accuracy_events.send(CombatAccuracyEvent::FlawlessKill { count: hit_count, is_warp: false });
+        } else {
+            accuracy_events.send(CombatAccuracyEvent::Miss { is_warp: false });
         }
     }
 }
@@ -402,6 +411,7 @@ pub fn player_chrono_warp_system(
     enemies_q: Query<(Entity, &Transform, &Enemy), Without<Player>>,
     audio: Option<Res<GameAudioAssets>>,
     mut slice_events: EventWriter<SliceEnemyEvent>,
+    mut accuracy_events: EventWriter<CombatAccuracyEvent>,
     mut commands: Commands,
 ) {
     let Ok((mut p_transform, mut player, mut energy)) = player_q.get_single_mut() else {
@@ -486,9 +496,11 @@ pub fn player_chrono_warp_system(
         let seg_end = clamped_target + Vec2::new(0.0, 16.0);
         let slice_radius = 28.0;
 
+        let mut hit_count = 0;
         for (e_entity, e_transform, enemy) in enemies_q.iter() {
             let enemy_center = e_transform.translation.xy() + Vec2::new(0.0, 16.0);
             if segment_intersects_circle(seg_start, seg_end, enemy_center, enemy.hitbox_radius + slice_radius) {
+                hit_count += 1;
                 let impulse = slice_dir * 450.0 + Vec2::new(0.0, 240.0);
                 slice_events.send(SliceEnemyEvent {
                     enemy_entity: e_entity,
@@ -498,6 +510,12 @@ pub fn player_chrono_warp_system(
                     is_warp_kill: true,
                 });
             }
+        }
+
+        if hit_count > 0 {
+            accuracy_events.send(CombatAccuracyEvent::FlawlessKill { count: hit_count, is_warp: true });
+        } else {
+            accuracy_events.send(CombatAccuracyEvent::Miss { is_warp: true });
         }
     }
 }
@@ -619,6 +637,7 @@ fn enemy_ai_system(
     mut player_q: Query<(&Transform, &mut Player), Without<Enemy>>,
     mut enemies_q: Query<(Entity, &mut Transform, &mut Enemy), Without<Player>>,
     platforms_q: Query<&Platform>,
+    mut accuracy_events: EventWriter<CombatAccuracyEvent>,
 ) {
     let dt = chrono.get_world_dt(time.delta_secs());
     if dt <= 0.0 {
@@ -706,6 +725,7 @@ fn enemy_ai_system(
                     if player.invulnerability_timer <= 0.0 {
                         player.health = (player.health - damage).max(0.0);
                         player.invulnerability_timer = 0.45;
+                        accuracy_events.send(CombatAccuracyEvent::TookDamage);
                     }
                 }
             }
